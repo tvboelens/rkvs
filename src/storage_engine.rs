@@ -1,7 +1,9 @@
 pub mod memtable;
+pub mod wal;
 
 pub struct StorageEngine {
     memtable: memtable::MemTable,
+    wal: wal::Wal,
 }
 
 impl StorageEngine {
