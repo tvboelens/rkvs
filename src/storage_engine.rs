@@ -5,7 +5,7 @@ pub struct StorageEngine {
 }
 
 impl StorageEngine {
-    pub fn get(&self, key: &String) -> Option<&String> {
+    pub fn get(&self, key: &String) -> Option<String> {
         /* This will have to get more sophisticated once we move to on-disk persistence */
         self.memtable.get(key)
     }

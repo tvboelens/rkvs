@@ -1,13 +1,23 @@
 use std::collections::HashMap;
+use std::sync::RwLock;
 
 pub struct MemTable {
-    table: HashMap<String, String>,
+    table: RwLock<HashMap<String, String>>,
     size: usize,
 }
 
 impl MemTable {
+    pub fn new() -> Self {
+        let map = HashMap::new();
+        MemTable {
+            table: RwLock::new(map),
+            size: 0,
+        }
+    }
+
     pub fn put(&mut self, key: String, value: String) -> Option<String> {
-        match self.table.insert(key, value) {
+        let mut table = self.table.write().unwrap();
+        match table.insert(key, value) {
             Some(v) => Some(v),
             None => {
                 self.size = self.size + 1;
@@ -16,19 +26,17 @@ impl MemTable {
         }
     }
 
-    pub fn get_copy(&self, key: &String) -> Option<String> {
-        match self.table.get(key) {
+    pub fn get(&self, key: &String) -> Option<String> {
+        let table = self.table.read().unwrap();
+        match table.get(key) {
             Some(v) => Some(v.clone()),
             None => None,
         }
     }
 
-    pub fn get(&self, key: &String) -> Option<&String> {
-        self.table.get(key)
-    }
-
     pub fn delete(&mut self, key: &String) -> Option<String> {
-        match self.table.remove(key) {
+        let mut table = self.table.write().unwrap();
+        match table.remove(key) {
             Some(v) => {
                 self.size = self.size - 1;
                 Some(v)
@@ -38,7 +46,8 @@ impl MemTable {
     }
 
     pub fn size(&self) -> usize {
-        self.size.clone()
+        let table = self.table.read().unwrap();
+        table.len()
     }
 }
 
@@ -47,10 +56,7 @@ mod tests {
     use super::*;
     #[test]
     fn put_get() {
-        let mut table = MemTable {
-            table: HashMap::new(),
-            size: 0,
-        };
+        let mut table = MemTable::new();
         let key = String::from("key");
         let key_read = key.clone();
         let value = String::from("value");
@@ -62,6 +68,6 @@ mod tests {
         let res = table.get(&key_read);
         assert!(res.is_some());
 
-        assert_eq!(res.unwrap(), &val_read);
+        assert_eq!(res.unwrap(), val_read);
     }
 }
