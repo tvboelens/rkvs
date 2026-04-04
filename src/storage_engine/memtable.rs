@@ -3,7 +3,6 @@ use std::sync::RwLock;
 
 pub struct MemTable {
     table: RwLock<HashMap<String, String>>,
-    size: usize,
 }
 
 impl MemTable {
@@ -11,41 +10,25 @@ impl MemTable {
         let map = HashMap::new();
         MemTable {
             table: RwLock::new(map),
-            size: 0,
         }
     }
 
     pub fn put(&mut self, key: String, value: String) -> Option<String> {
         let mut table = self.table.write().unwrap();
-        match table.insert(key, value) {
-            Some(v) => Some(v),
-            None => {
-                self.size = self.size + 1;
-                None
-            }
-        }
+        table.insert(key, value)
     }
 
     pub fn get(&self, key: &String) -> Option<String> {
         let table = self.table.read().unwrap();
-        match table.get(key) {
-            Some(v) => Some(v.clone()),
-            None => None,
-        }
+        table.get(key).cloned()
     }
 
     pub fn delete(&mut self, key: &String) -> Option<String> {
         let mut table = self.table.write().unwrap();
-        match table.remove(key) {
-            Some(v) => {
-                self.size = self.size - 1;
-                Some(v)
-            }
-            None => None,
-        }
+        table.remove(key)
     }
 
-    pub fn size(&self) -> usize {
+    pub fn len(&self) -> usize {
         let table = self.table.read().unwrap();
         table.len()
     }
@@ -63,11 +46,10 @@ mod tests {
         let val_read = value.clone();
         let result = table.put(key, value);
         assert!(result.is_none());
-        let size = table.size();
-        assert_eq!(size, 1);
+        let len = table.len();
+        assert_eq!(len, 1);
         let res = table.get(&key_read);
         assert!(res.is_some());
-
         assert_eq!(res.unwrap(), val_read);
     }
 }
