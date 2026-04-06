@@ -1,36 +1,30 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
 
 pub struct MemTable {
-    table: RwLock<HashMap<String, String>>,
+    table: HashMap<String, String>,
 }
 
 impl MemTable {
     pub fn new() -> Self {
-        let map = HashMap::new();
         MemTable {
-            table: RwLock::new(map),
+            table: HashMap::new(),
         }
     }
 
     pub fn put(&mut self, key: String, value: String) -> Option<String> {
-        let mut table = self.table.write().unwrap();
-        table.insert(key, value)
+        self.table.insert(key, value)
     }
 
     pub fn get(&self, key: &String) -> Option<String> {
-        let table = self.table.read().unwrap();
-        table.get(key).cloned()
+        self.table.get(key).cloned()
     }
 
     pub fn delete(&mut self, key: &String) -> Option<String> {
-        let mut table = self.table.write().unwrap();
-        table.remove(key)
+        self.table.remove(key)
     }
 
     pub fn len(&self) -> usize {
-        let table = self.table.read().unwrap();
-        table.len()
+        self.table.len()
     }
 }
 
