@@ -1,3 +1,5 @@
+use ::std::mem::size_of;
+use crc;
 use std::fs::File;
 use std::io::{Error, ErrorKind, Write};
 
@@ -11,11 +13,23 @@ enum SerError {
     InvalidValue,
 }
 
-static HEADER_SIZE: usize = 12;
+// length 4 bytes checksum 4 bytes
+static HEADER_SIZE: usize = size_of::<usize>() + size_of::<u32>();
+// crc32 with Castagnoli polynomial
+static CHECKSUM_ALG: crc::Algorithm<u32> = crc::Algorithm {
+    width: 32,
+    poly: 0x1edc6f41,
+    init: 0xffffffff,
+    refin: true,
+    refout: true,
+    xorout: 0xffffffff,
+    residue: 0xb798b438,
+    check: 0xe3069283,
+};
 
 /*
 methods:
-1. sync
+1. sync -> done
 2. rotate
 3. recover?
 4. append
@@ -26,10 +40,10 @@ methods:
 */
 
 pub struct WalEntry {
-    operation_type: OpType,
-    key: String,
-    value: String,
-    sequence_number: u64,
+    pub operation_type: OpType,
+    pub key: String,
+    pub value: String,
+    pub sequence_number: u64,
 }
 
 pub struct Wal {
@@ -53,10 +67,13 @@ impl Wal {
 
     pub fn append(&mut self, entry: &WalEntry) -> std::io::Result<()> {
         match Wal::serialize_entry(entry) {
-            Ok(buf) => self
-                .file
-                .write_all(buf.as_slice())
-                .map(|_| self.last_sequence_number = entry.sequence_number),
+            Ok(buf) => {
+                let buf_size = buf.len() as u64;
+                self.file.write_all(buf.as_slice()).map(|_| {
+                    self.last_sequence_number = entry.sequence_number;
+                    self.file_size = self.file_size + buf_size;
+                })
+            }
             Err(e) => match e {
                 SerError::InvalidKey => Err(Error::new(
                     ErrorKind::Other,
@@ -96,13 +113,15 @@ impl Wal {
         buf[buf_size - 4..buf_size].copy_from_slice(&entry.sequence_number.to_le_bytes());
 
         let checksum = Wal::calculate_checksum(&buf[HEADER_SIZE..buf_size]);
-        buf[0..3].copy_from_slice(&buf_size.to_le_bytes());
-        buf[4..HEADER_SIZE].copy_from_slice(&checksum.to_le_bytes());
-
+        buf[0..size_of::<usize>()].copy_from_slice(&buf_size.to_le_bytes());
+        buf[size_of::<usize>()..HEADER_SIZE].copy_from_slice(&checksum.to_le_bytes());
         Ok(buf)
     }
 
-    fn calculate_checksum(_buf: &[u8]) -> u64 {
-        0
+    fn calculate_checksum(buf: &[u8]) -> u32 {
+        let crc32 = crc::Crc::<u32>::new(&CHECKSUM_ALG);
+        let mut digest = crc32.digest();
+        digest.update(buf);
+        digest.finalize()
     }
 }
