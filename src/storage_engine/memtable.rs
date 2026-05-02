@@ -4,6 +4,14 @@ pub struct MemTable {
     table: HashMap<String, String>,
 }
 
+impl Clone for MemTable {
+    fn clone(&self) -> Self {
+        MemTable {
+            table: self.table.clone(),
+        }
+    }
+}
+
 impl MemTable {
     pub fn new() -> Self {
         MemTable {
