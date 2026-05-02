@@ -1,9 +1,10 @@
+use std::error::Error;
 use std::io;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, SendError};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use tokio::sync::oneshot::Sender;
 
 pub mod memtable;
 pub mod wal;
@@ -19,7 +20,7 @@ pub enum WriteData {
 
 pub struct WriteJob {
     pub data: WriteData,
-    pub sender: oneshot::Sender<io::Result<Option<String>>>,
+    pub sender: Sender<io::Result<Option<String>>>,
 }
 
 pub struct StorageEngine {
@@ -100,7 +101,7 @@ impl Worker {
                     }
                 },
                 Ok(job) => {
-                    self.handle_write(job);
+                    self.do_write(job);
                     elapsed -= Instant::now() - last_sync;
                     if elapsed.is_zero() {
                         self.wal.sync().unwrap();
@@ -112,72 +113,52 @@ impl Worker {
         }
     }
 
-    fn handle_write(&mut self, job: WriteJob) {
+    fn do_write(&mut self, job: WriteJob) {
         match job.data {
-            WriteData::Delete(key) => {
-                let entry = wal::WalEntry {
-                    operation_type: wal::OpType::Delete,
-                    key: key.clone(),
-                    value: String::new(),
-                    sequence_number: self.wal.last_sequence_number() + 1,
-                };
-                match self.wal.append(&entry) {
-                    Err(e) => {
-                        if let Err(_) = job.sender.send(Err(e)) {
-                            ()
-                        }
-                    }
-                    Ok(_) => {
-                        let mut memtable =
-                            unsafe { (*self.memtable.load(Ordering::Relaxed)).clone() };
-                        match memtable.delete(&key) {
-                            Some(value) => {
-                                let _ = self.memtable.swap(&mut memtable, Ordering::Release);
-                                if let Err(_) = job.sender.send(Ok(Some(value))) {
-                                    ()
-                                }
-                            }
-                            None => {
-                                if let Err(_) = job.sender.send(Ok(None)) {
-                                    ()
-                                }
-                            }
-                        }
-                    }
-                }
+            WriteData::Delete(key) => match job.sender.send(self.do_delete(key)) {
+                _ => (),
+            },
+            WriteData::Put(data) => match job.sender.send(self.do_put(data)) {
+                _ => (),
+            },
+        }
+    }
+
+    fn do_delete(&mut self, key: String) -> Result<Option<String>, std::io::Error> {
+        let entry = wal::WalEntry {
+            operation_type: wal::OpType::Delete,
+            key: key.clone(),
+            value: String::new(),
+            sequence_number: self.wal.last_sequence_number() + 1,
+        };
+        self.wal.append(&entry)?;
+        let mut memtable = unsafe { (*self.memtable.load(Ordering::Relaxed)).clone() };
+        match memtable.delete(&key) {
+            Some(value) => {
+                let _ = self.memtable.swap(&mut memtable, Ordering::Release);
+                Ok(Some(value))
             }
-            WriteData::Put(data) => {
-                let entry = wal::WalEntry {
-                    operation_type: wal::OpType::Put,
-                    key: data.key.clone(),
-                    value: data.value.clone(),
-                    sequence_number: self.wal.last_sequence_number() + 1,
-                };
-                match self.wal.append(&entry) {
-                    Err(e) => {
-                        if let Err(_) = job.sender.send(Err(e)) {
-                            ()
-                        }
-                    }
-                    Ok(_) => {
-                        let mut memtable =
-                            unsafe { (*self.memtable.load(Ordering::Relaxed)).clone() };
-                        match memtable.put(data.key, data.value) {
-                            Some(value) => {
-                                let _ = self.memtable.swap(&mut memtable, Ordering::Release);
-                                if let Err(_) = job.sender.send(Ok(Some(value))) {
-                                    ()
-                                }
-                            }
-                            None => {
-                                let _ = self.memtable.swap(&mut memtable, Ordering::Release);
-                                if let Err(_) = job.sender.send(Ok(None)) {
-                                    ()
-                                }
-                            }
-                        }
-                    }
-                }
+            None => Ok(None),
+        }
+    }
+
+    fn do_put(&mut self, data: PutData) -> Result<Option<String>, std::io::Error> {
+        let entry = wal::WalEntry {
+            operation_type: wal::OpType::Put,
+            key: data.key.clone(),
+            value: data.value.clone(),
+            sequence_number: self.wal.last_sequence_number() + 1,
+        };
+        self.wal.append(&entry)?;
+        let mut memtable = unsafe { (*self.memtable.load(Ordering::Relaxed)).clone() };
+        match memtable.put(data.key, data.value) {
+            Some(value) => {
+                let _ = self.memtable.swap(&mut memtable, Ordering::Release);
+                Ok(Some(value))
+            }
+            None => {
+                let _ = self.memtable.swap(&mut memtable, Ordering::Release);
+                Ok(None)
             }
         }
     }
