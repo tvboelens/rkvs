@@ -42,6 +42,12 @@ pub struct TcpRequest {
     pub payload: Payload,
 }
 
+pub struct TcpResponse {
+    correlation_id: Uuid,
+    response_code: u16,
+    payload: Option<String>,
+}
+
 fn verify_magic_bytes(buf: &[u8; 4]) -> bool {
     return *buf == MAGIC_BYTES;
 }
@@ -149,6 +155,49 @@ pub async fn recv_tcp_request(stream: &mut TcpStream) -> Result<TcpRequest, TcpE
 impl From<io::Error> for TcpError {
     fn from(value: io::Error) -> Self {
         TcpError::IoError(value)
+    }
+}
+
+fn server_error_to_rc(error: &super::ServerError) -> u16 {
+    0
+}
+
+impl TcpResponse {
+    pub fn from_error(correlation_id: &Uuid, error: &super::ServerError) -> Self {
+        TcpResponse {
+            correlation_id: *correlation_id,
+            response_code: server_error_to_rc(error),
+            payload: None,
+        }
+    }
+
+    pub fn from(correlation_id: &Uuid, value: Option<String>) -> Self {
+        TcpResponse {
+            correlation_id: *correlation_id,
+            response_code: 0,
+            payload: value,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match &self.payload {
+            Some(str) => str.len() + 6,
+            None => 6,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::<u8>::new();
+        buf.resize(self.len(), 0);
+        buf[0..4].copy_from_slice(self.correlation_id.as_bytes());
+        buf[4..6].copy_from_slice(&self.response_code.to_be_bytes());
+        match &self.payload {
+            None => buf,
+            Some(str) => {
+                buf[6..].copy_from_slice(str.as_bytes());
+                buf
+            }
+        }
     }
 }
 
