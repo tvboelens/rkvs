@@ -1,4 +1,3 @@
-use std::error::Error;
 use std::io;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, SendError};
@@ -42,14 +41,12 @@ pub struct StorageEngineConf {
 
 impl StorageEngine {
     pub fn new(config: StorageEngineConf) -> Self {
-        let memtable = memtable::MemTable::new();
-        let ptr = &mut memtable;
-        let memtable_ptr = Arc::new(AtomicPtr::new(ptr));
-        //let memtable = Arc::new(RwLock::new(memtable::MemTable::new()));
-        let wal = wal::Wal {};
+        let mut memtable = memtable::MemTable::new();
+        let memtable_ptr = Arc::new(AtomicPtr::new(&mut memtable));
+        let wal = wal::Wal::from(0);
         let (tx, rx) = mpsc::channel();
 
-        let worker = Worker {
+        let mut worker = Worker {
             memtable: memtable_ptr.clone(),
             wal: wal,
             receiver: rx,
@@ -82,7 +79,7 @@ impl StorageEngine {
 
     pub fn shutdown(self) {
         drop(self.sender);
-        let _ = self.join_handle.join();
+        self.join_handle.join().unwrap_or(());
     }
 }
 
@@ -115,12 +112,8 @@ impl Worker {
 
     fn do_write(&mut self, job: WriteJob) {
         match job.data {
-            WriteData::Delete(key) => match job.sender.send(self.do_delete(key)) {
-                _ => (),
-            },
-            WriteData::Put(data) => match job.sender.send(self.do_put(data)) {
-                _ => (),
-            },
+            WriteData::Delete(key) => job.sender.send(self.do_delete(key)).unwrap_or(()),
+            WriteData::Put(data) => job.sender.send(self.do_put(data)).unwrap_or(()),
         }
     }
 
