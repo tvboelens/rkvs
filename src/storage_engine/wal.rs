@@ -53,6 +53,16 @@ pub struct Wal {
 }
 
 impl Wal {
+    pub fn from(sequence_number: u64) -> Self {
+        let path = sequence_number.to_string();
+        let file = File::create(path).unwrap();
+        Wal {
+            file: file,
+            file_size: 0,
+            last_sequence_number: sequence_number,
+        }
+    }
+
     pub fn sync(&self) -> std::io::Result<()> {
         self.file.sync_all()
     }
