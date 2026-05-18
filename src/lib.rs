@@ -4,15 +4,13 @@ pub mod tcp_protocol;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tcp_protocol::{TcpRequest, TcpResponse, recv_tcp_request};
+use tcp_protocol::{TcpError, TcpRequest, TcpResponse, recv_tcp_request};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::storage_engine::{StorageEngine, WriteData, WriteJob};
-
-static RESPONSE_RETRY_COUNT: u8 = 5;
 
 pub struct Server {
     storage_engine: Arc<StorageEngine>,
@@ -30,13 +28,13 @@ enum Operation {
 }
 
 #[derive(Debug)]
-enum ServerError {
+pub enum ServerError {
     StorageEngine(StorageEngineError),
-    TcpError(tcp_protocol::TcpError),
+    TcpError(TcpError),
 }
 
 #[derive(Debug)]
-enum StorageEngineError {
+pub enum StorageEngineError {
     IoError,
     NotFound,
     Shutdown,
@@ -61,11 +59,11 @@ async fn call_storage_engine(
                 data: WriteData::Delete(key),
                 sender: tx,
             };
-            match storage_engine.submit_delete(job) {
-                Ok(_) => match rx.await {
-                    Ok(res) => res.map_err(|_| StorageEngineError::IoError),
-                    Err(_) => Err(StorageEngineError::Shutdown),
-                },
+            storage_engine
+                .submit_delete(job)
+                .map_err(|_| StorageEngineError::Shutdown)?;
+            match rx.await {
+                Ok(res) => res.map_err(|_| StorageEngineError::IoError),
                 Err(_) => Err(StorageEngineError::Shutdown),
             }
         }
@@ -82,11 +80,11 @@ async fn call_storage_engine(
                 }),
                 sender: tx,
             };
-            match storage_engine.submit_put(job) {
-                Ok(_) => match rx.await {
-                    Ok(res) => res.map_err(|_| StorageEngineError::IoError),
-                    Err(_) => Err(StorageEngineError::Shutdown),
-                },
+            storage_engine
+                .submit_put(job)
+                .map_err(|_| StorageEngineError::Shutdown)?;
+            match rx.await {
+                Ok(res) => res.map_err(|_| StorageEngineError::IoError),
                 Err(_) => Err(StorageEngineError::Shutdown),
             }
         }
@@ -161,6 +159,28 @@ impl From<TcpRequest> for Operation {
                 key: request.payload.key,
                 value: request.payload.value.unwrap(),
             }),
+        }
+    }
+}
+
+impl ServerError {
+    pub fn to_rc(&self) -> u8 {
+        match self {
+            Self::StorageEngine(e) => match e {
+                StorageEngineError::IoError => 1,
+                StorageEngineError::NotFound => 2,
+                StorageEngineError::Shutdown => 3,
+            },
+            Self::TcpError(e) => match e {
+                TcpError::InvalidKey(_) => 4,
+                TcpError::InvalidValue(_) => 5,
+                TcpError::MissingValue(_) => 6,
+                TcpError::MalformedPayload(_) => 7,
+                TcpError::InvalidRequestType(_) => 8,
+                TcpError::UnknownFlags(_) => 9,
+                TcpError::UnsupportedVersion(_) => 10,
+                _ => 255,
+            },
         }
     }
 }
