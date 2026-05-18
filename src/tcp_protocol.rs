@@ -1,3 +1,4 @@
+use super::ServerError;
 use std::io;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -19,6 +20,7 @@ pub enum TcpError {
     MalformedPayload(Uuid), // general errors
 }
 
+#[derive(Debug, PartialEq)]
 pub enum RequestType {
     Get,
     Put,
@@ -44,7 +46,7 @@ pub struct TcpRequest {
 
 pub struct TcpResponse {
     correlation_id: Uuid,
-    response_code: u16,
+    response_code: u8,
     payload: Option<String>,
 }
 
@@ -65,14 +67,14 @@ fn parse_headers(buf: &Vec<u8>) -> Result<TcpHeaders, TcpError> {
     if !verify_magic_bytes(&buf[0..4].try_into().unwrap()) {
         return Err(TcpError::WrongMagicBytes);
     }
-    let correlation_id = Uuid::from_bytes(buf[4..12].try_into().unwrap());
-    let version = buf[12];
+    let correlation_id = Uuid::from_bytes(buf[4..20].try_into().unwrap());
+    let version = buf[20];
     if version > PROTOCOL_VERSION {
         return Err(TcpError::UnsupportedVersion(correlation_id));
     }
     let request_type =
-        parse_request_type(buf[13]).map_err(|_| TcpError::InvalidRequestType(correlation_id))?;
-    let flags = u16::from_be_bytes(buf[14..16].try_into().unwrap());
+        parse_request_type(buf[21]).map_err(|_| TcpError::InvalidRequestType(correlation_id))?;
+    let flags = u16::from_be_bytes(buf[22..24].try_into().unwrap());
 
     // TODO: optional headers
     Ok(TcpHeaders {
@@ -95,13 +97,13 @@ fn parse_payload(
         .map_err(|_| TcpError::InvalidKey(*correlation_id))?;
     match request_type {
         RequestType::Put => {
-            if key_len >= payload_len {
+            if key_len >= payload_len - 4 {
                 Err(TcpError::MissingValue(*correlation_id))
             } else {
                 let value_len_u32 =
-                    u32::from_be_bytes(buf[key_len + 8..key_len + 12].try_into().unwrap());
+                    u32::from_be_bytes(buf[key_len + 4..key_len + 8].try_into().unwrap());
                 let value_len = usize::try_from(value_len_u32).unwrap();
-                let value = String::from_utf8(buf[key_len + 12..key_len + 12 + value_len].to_vec())
+                let value = String::from_utf8(buf[key_len + 8..key_len + 8 + value_len].to_vec())
                     .map_err(|_| TcpError::InvalidValue(*correlation_id))?;
                 Ok(Payload {
                     key: key,
@@ -110,7 +112,7 @@ fn parse_payload(
             }
         }
         _ => {
-            if key_len < payload_len {
+            if key_len < payload_len - 4 {
                 Err(TcpError::MalformedPayload(*correlation_id))
             } else {
                 Ok(Payload {
@@ -158,15 +160,11 @@ impl From<io::Error> for TcpError {
     }
 }
 
-fn server_error_to_rc(error: &super::ServerError) -> u16 {
-    0
-}
-
 impl TcpResponse {
-    pub fn from_error(correlation_id: &Uuid, error: &super::ServerError) -> Self {
+    pub fn from_error(correlation_id: &Uuid, error: &ServerError) -> Self {
         TcpResponse {
             correlation_id: *correlation_id,
-            response_code: server_error_to_rc(error),
+            response_code: error.to_rc(),
             payload: None,
         }
     }
@@ -181,8 +179,8 @@ impl TcpResponse {
 
     pub fn len(&self) -> usize {
         match &self.payload {
-            Some(str) => str.len() + 6,
-            None => 6,
+            Some(str) => str.len() + 5,
+            None => 5,
         }
     }
 
@@ -190,23 +188,200 @@ impl TcpResponse {
         let mut buf = Vec::<u8>::new();
         buf.resize(self.len(), 0);
         buf[0..4].copy_from_slice(self.correlation_id.as_bytes());
-        buf[4..6].copy_from_slice(&self.response_code.to_be_bytes());
+        buf[4] = self.response_code;
         match &self.payload {
             None => buf,
             Some(str) => {
-                buf[6..].copy_from_slice(str.as_bytes());
+                buf[5..].copy_from_slice(str.as_bytes());
                 buf
             }
         }
     }
 }
 
+impl TcpHeaders {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.resize(self.len(), 0);
+        buf[0..16].copy_from_slice(&self.correlation_id.to_bytes_le());
+        buf[16] = self.protocol_version;
+        buf[17] = match self.request_type {
+            RequestType::Delete => 0,
+            RequestType::Get => 1,
+            RequestType::Put => 2,
+        };
+        buf[18..20].copy_from_slice(&self.flags.to_be_bytes());
+        buf
+    }
+
+    pub fn len(&self) -> usize {
+        20 // correlation id: 16, type: 1, flags: 2, version: 1
+    }
+}
+
+impl Payload {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::<u8>::new();
+        let key_len = self.key.len();
+        match &self.value {
+            Some(value) => buf.resize(key_len + 8 + value.len(), 0),
+            None => buf.resize(key_len + 4, 0),
+        }
+        let key_len_u32: u32 = key_len.try_into().unwrap();
+        buf[0..4].copy_from_slice(&key_len_u32.to_be_bytes());
+        buf[4..key_len + 4].copy_from_slice(self.key.as_bytes());
+        match &self.value {
+            Some(value) => {
+                let value_len: u32 = value.len().try_into().unwrap();
+                buf[key_len + 4..key_len + 8].copy_from_slice(&value_len.to_be_bytes());
+                buf[key_len + 8..].copy_from_slice(value.as_bytes());
+            }
+            None => (),
+        }
+        buf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::tcp_protocol::TcpError;
+
+    use super::{RequestType, TcpHeaders, parse_headers};
+    use uuid::Uuid;
+    #[test]
+    fn parse_headers_ok() {
+        let headers_write = TcpHeaders {
+            correlation_id: Uuid::from_u128(1),
+            request_type: RequestType::Delete,
+            protocol_version: 0,
+            flags: 0,
+        };
+        let mut buf = Vec::<u8>::new();
+        buf.resize(headers_write.len() + 4, 0);
+        buf[0..4].copy_from_slice(&super::MAGIC_BYTES);
+        buf[4..].copy_from_slice(&headers_write.to_bytes());
+        let headers_read = parse_headers(&buf);
+        assert!(headers_read.is_ok());
+        assert_eq!(headers_read.as_ref().unwrap().correlation_id.as_u128(), 1);
+        assert_eq!(headers_read.as_ref().unwrap().flags, 0);
+        assert_eq!(headers_read.as_ref().unwrap().protocol_version, 0);
+        assert_eq!(
+            headers_read.as_ref().unwrap().request_type,
+            RequestType::Delete
+        );
+    }
+
+    #[test]
+    fn parse_headers_wrong_magic_bytes() {
+        use super::TcpError;
+        let headers_write = TcpHeaders {
+            correlation_id: Uuid::from_u128(1),
+            request_type: RequestType::Delete,
+            protocol_version: 0,
+            flags: 0,
+        };
+        let mut buf = Vec::<u8>::new();
+        buf.resize(headers_write.len() + 4, 0);
+        buf[0..4].copy_from_slice(&super::MAGIC_BYTES);
+        buf[0] += 1;
+        buf[4..].copy_from_slice(&headers_write.to_bytes());
+        let headers_read = parse_headers(&buf);
+        assert!(matches!(headers_read, Err(TcpError::WrongMagicBytes)));
+    }
+
+    use super::{Payload, parse_payload};
+
+    #[test]
+    fn parse_payload_delete_ok() {
+        let payload_write = Payload {
+            key: String::from("key"),
+            value: None,
+        };
+        let buf = payload_write.to_bytes();
+        let correlation_id = Uuid::from_u128(20);
+        let payload = parse_payload(&buf, &RequestType::Delete, &correlation_id);
+        assert!(payload.is_ok());
+        assert_eq!(payload_write.key, payload.as_ref().unwrap().key);
+        assert!(payload.as_ref().unwrap().value.is_none());
+    }
+
+    #[test]
+    fn parse_payload_get_ok() {
+        let payload_write = Payload {
+            key: String::from("key"),
+            value: None,
+        };
+        let buf = payload_write.to_bytes();
+        let correlation_id = Uuid::from_u128(20);
+        let payload = parse_payload(&buf, &RequestType::Get, &correlation_id);
+        assert!(payload.is_ok());
+        assert_eq!(payload_write.key, payload.as_ref().unwrap().key);
+        assert!(payload.as_ref().unwrap().value.is_none());
+    }
+
+    #[test]
+    fn parse_payload_put_ok() {
+        let payload_write = Payload {
+            key: String::from("key"),
+            value: Some(String::from("value")),
+        };
+        let buf = payload_write.to_bytes();
+        let correlation_id = Uuid::from_u128(20);
+        let payload = parse_payload(&buf, &RequestType::Put, &correlation_id);
+        assert!(payload.is_ok());
+        assert_eq!(payload_write.key, payload.as_ref().unwrap().key);
+        assert!(payload.as_ref().unwrap().value.is_some());
+        assert_eq!(
+            payload_write.value.as_ref().unwrap(),
+            payload.as_ref().unwrap().value.as_ref().unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_payload_put_no_value() {
+        let payload_write = Payload {
+            key: String::from("key"),
+            value: None,
+        };
+        let buf = payload_write.to_bytes();
+        let correlation_id = Uuid::from_u128(20);
+        let payload = parse_payload(&buf, &RequestType::Put, &correlation_id);
+        assert!(matches!(payload, Err(TcpError::MissingValue(_))));
+    }
+
+    #[test]
+    fn parse_payload_get_with_value() {
+        let payload_write = Payload {
+            key: String::from("key"),
+            value: Some(String::from("value")),
+        };
+        let buf = payload_write.to_bytes();
+        let correlation_id = Uuid::from_u128(20);
+        let payload = parse_payload(&buf, &RequestType::Get, &correlation_id);
+        assert!(matches!(payload, Err(TcpError::MalformedPayload(_))));
+    }
+
+    #[test]
+    fn parse_payload_delete_with_value() {
+        let payload_write = Payload {
+            key: String::from("key"),
+            value: Some(String::from("value")),
+        };
+        let buf = payload_write.to_bytes();
+        let correlation_id = Uuid::from_u128(20);
+        let payload = parse_payload(&buf, &RequestType::Delete, &correlation_id);
+        assert!(matches!(payload, Err(TcpError::MalformedPayload(_))));
+    }
+}
+
 /* Test cases:
     1. Ok
-        1. Different types
-    2. First 4 bytes are not the magic bytes
+        1. Headers
+        2. Payload Different types
+    2. First 4 bytes are not the magic bytes -> done
     3. Wrong payload
-        1. Put but no value
+        1. Put but no value -> done
         2. Get or delete but given value
         3. Strings are malformed, i.e. no utf8 bytes
     4. Unsupported version
