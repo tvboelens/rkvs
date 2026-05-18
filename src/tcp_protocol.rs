@@ -244,13 +244,11 @@ impl Payload {
 
 #[cfg(test)]
 mod tests {
-
-    use crate::tcp_protocol::TcpError;
-
-    use super::{RequestType, TcpHeaders, parse_headers};
+    use super::{RequestType, TcpError, TcpHeaders, parse_headers};
     use uuid::Uuid;
+
     #[test]
-    fn parse_headers_ok() {
+    fn parse_headers_ok_delete() {
         let headers_write = TcpHeaders {
             correlation_id: Uuid::from_u128(1),
             request_type: RequestType::Delete,
@@ -270,6 +268,66 @@ mod tests {
             headers_read.as_ref().unwrap().request_type,
             RequestType::Delete
         );
+    }
+
+    fn parse_headers_ok_get() {
+        let headers_write = TcpHeaders {
+            correlation_id: Uuid::from_u128(64),
+            request_type: RequestType::Get,
+            protocol_version: 0,
+            flags: 0,
+        };
+        let mut buf = Vec::<u8>::new();
+        buf.resize(headers_write.len() + 4, 0);
+        buf[0..4].copy_from_slice(&super::MAGIC_BYTES);
+        buf[4..].copy_from_slice(&headers_write.to_bytes());
+        let headers_read = parse_headers(&buf);
+        assert!(headers_read.is_ok());
+        assert_eq!(headers_read.as_ref().unwrap().correlation_id.as_u128(), 1);
+        assert_eq!(headers_read.as_ref().unwrap().flags, 0);
+        assert_eq!(headers_read.as_ref().unwrap().protocol_version, 0);
+        assert_eq!(
+            headers_read.as_ref().unwrap().request_type,
+            RequestType::Delete
+        );
+    }
+
+    fn parse_headers_ok_put() {
+        let headers_write = TcpHeaders {
+            correlation_id: Uuid::from_u128(1024),
+            request_type: RequestType::Put,
+            protocol_version: 0,
+            flags: 0,
+        };
+        let mut buf = Vec::<u8>::new();
+        buf.resize(headers_write.len() + 4, 0);
+        buf[0..4].copy_from_slice(&super::MAGIC_BYTES);
+        buf[4..].copy_from_slice(&headers_write.to_bytes());
+        let headers_read = parse_headers(&buf);
+        assert!(headers_read.is_ok());
+        assert_eq!(headers_read.as_ref().unwrap().correlation_id.as_u128(), 1);
+        assert_eq!(headers_read.as_ref().unwrap().flags, 0);
+        assert_eq!(headers_read.as_ref().unwrap().protocol_version, 0);
+        assert_eq!(
+            headers_read.as_ref().unwrap().request_type,
+            RequestType::Delete
+        );
+    }
+
+    #[test]
+    fn parse_headers_wrong_version() {
+        let headers_write = TcpHeaders {
+            correlation_id: Uuid::from_u128(1),
+            request_type: RequestType::Delete,
+            protocol_version: 1,
+            flags: 0,
+        };
+        let mut buf = Vec::<u8>::new();
+        buf.resize(headers_write.len() + 4, 0);
+        buf[0..4].copy_from_slice(&super::MAGIC_BYTES);
+        buf[4..].copy_from_slice(&headers_write.to_bytes());
+        let headers_read = parse_headers(&buf);
+        assert!(matches!(headers_read, Err(TcpError::UnsupportedVersion(_))))
     }
 
     #[test]
@@ -378,13 +436,14 @@ mod tests {
 /* Test cases:
     1. Ok
         1. Headers
-        2. Payload Different types
+        2. Payload Different types -> done
     2. First 4 bytes are not the magic bytes -> done
     3. Wrong payload
         1. Put but no value -> done
-        2. Get or delete but given value
+        2. Get or delete but given value -> done
         3. Strings are malformed, i.e. no utf8 bytes
-    4. Unsupported version
-    5. Unknown request typw
+    4. Unsupported version -> done
+    5. Unknown request type
+    6. payload too large
 
 */
