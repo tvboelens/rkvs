@@ -8,6 +8,12 @@ use tokio::sync::oneshot::Sender;
 pub mod memtable;
 pub mod wal;
 
+pub trait Store {
+    fn get(&self, key: &String) -> Option<String>;
+    fn submit_put(&self, job: WriteJob) -> Result<(), SendError<WriteJob>>;
+    fn submit_delete(&self, job: WriteJob) -> Result<(), SendError<WriteJob>>;
+}
+
 pub struct PutData {
     pub key: String,
     pub value: String,
@@ -39,6 +45,25 @@ pub struct StorageEngineConf {
     timeout: Duration,
 }
 
+impl Store for StorageEngine {
+    fn get(&self, key: &String) -> Option<String> {
+        /* This will have to get more sophisticated once we move to on-disk persistence
+           Also the unwrap should be replaced later by something that returns None
+           so that the server can return a not found error or similar
+        */
+        let memtable: &memtable::MemTable = unsafe { &*self.memtable.load(Ordering::Acquire) };
+        memtable.get(key)
+    }
+
+    fn submit_put(&self, job: WriteJob) -> Result<(), SendError<WriteJob>> {
+        self.sender.send(job)
+    }
+
+    fn submit_delete(&self, job: WriteJob) -> Result<(), SendError<WriteJob>> {
+        self.sender.send(job)
+    }
+}
+
 impl StorageEngine {
     pub fn new(config: StorageEngineConf) -> Self {
         let mut memtable = memtable::MemTable::new();
@@ -58,23 +83,6 @@ impl StorageEngine {
             sender: tx,
             join_handle: handle,
         }
-    }
-
-    pub fn get(&self, key: &String) -> Option<String> {
-        /* This will have to get more sophisticated once we move to on-disk persistence
-           Also the unwrap should be replaced later by something that returns None
-           so that the server can return a not found error or similar
-        */
-        let memtable: &memtable::MemTable = unsafe { &*self.memtable.load(Ordering::Acquire) };
-        memtable.get(key)
-    }
-
-    pub fn submit_put(&self, job: WriteJob) -> Result<(), SendError<WriteJob>> {
-        self.sender.send(job)
-    }
-
-    pub fn submit_delete(&self, job: WriteJob) -> Result<(), SendError<WriteJob>> {
-        self.sender.send(job)
     }
 
     pub fn shutdown(self) {

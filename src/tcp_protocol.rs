@@ -1,7 +1,6 @@
 use super::ServerError;
 use std::io;
 use tokio::io::AsyncReadExt;
-use tokio::net::TcpStream;
 use uuid::Uuid;
 
 static PROTOCOL_VERSION: u8 = 0;
@@ -124,25 +123,34 @@ fn parse_payload(
     }
 }
 
-async fn recv_headers(stream: &mut TcpStream, len: &u32) -> Result<Vec<u8>, TcpError> {
+async fn recv_headers<T>(reader: &mut T, len: &u32) -> Result<Vec<u8>, TcpError>
+where
+    T: AsyncReadExt + Unpin,
+{
     let mut buf = Vec::<u8>::new();
     let header_len: usize = usize::try_from(*len).unwrap();
     buf.resize(header_len, 0);
 
-    let _ = stream.read_exact(&mut buf).await?;
+    let _ = reader.read_exact(&mut buf).await?;
     Ok(buf)
 }
 
-async fn recv_payload(stream: &mut TcpStream, len: &u32) -> Result<Vec<u8>, TcpError> {
+async fn recv_payload<T>(reader: &mut T, len: &u32) -> Result<Vec<u8>, TcpError>
+where
+    T: AsyncReadExt + Unpin,
+{
     let mut buf = Vec::<u8>::new();
     let payload_len: usize = usize::try_from(*len).unwrap();
     buf.resize(payload_len, 0);
 
-    let _ = stream.read_exact(&mut buf).await?;
+    let _ = reader.read_exact(&mut buf).await?;
     Ok(buf)
 }
 
-pub async fn recv_tcp_request(stream: &mut TcpStream) -> Result<TcpRequest, TcpError> {
+pub async fn recv_tcp_request<T>(stream: &mut T) -> Result<TcpRequest, TcpError>
+where
+    T: AsyncReadExt + Unpin,
+{
     let header_len = stream.read_u32().await?;
     let headers = recv_headers(stream, &header_len)
         .await
@@ -270,6 +278,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn parse_headers_ok_get() {
         let headers_write = TcpHeaders {
             correlation_id: Uuid::from_u128(64),
@@ -283,15 +292,16 @@ mod tests {
         buf[4..].copy_from_slice(&headers_write.to_bytes());
         let headers_read = parse_headers(&buf);
         assert!(headers_read.is_ok());
-        assert_eq!(headers_read.as_ref().unwrap().correlation_id.as_u128(), 1);
+        assert_eq!(headers_read.as_ref().unwrap().correlation_id.as_u128(), 64);
         assert_eq!(headers_read.as_ref().unwrap().flags, 0);
         assert_eq!(headers_read.as_ref().unwrap().protocol_version, 0);
         assert_eq!(
             headers_read.as_ref().unwrap().request_type,
-            RequestType::Delete
+            RequestType::Get
         );
     }
 
+    #[test]
     fn parse_headers_ok_put() {
         let headers_write = TcpHeaders {
             correlation_id: Uuid::from_u128(1024),
@@ -305,12 +315,15 @@ mod tests {
         buf[4..].copy_from_slice(&headers_write.to_bytes());
         let headers_read = parse_headers(&buf);
         assert!(headers_read.is_ok());
-        assert_eq!(headers_read.as_ref().unwrap().correlation_id.as_u128(), 1);
+        assert_eq!(
+            headers_read.as_ref().unwrap().correlation_id.as_u128(),
+            1024
+        );
         assert_eq!(headers_read.as_ref().unwrap().flags, 0);
         assert_eq!(headers_read.as_ref().unwrap().protocol_version, 0);
         assert_eq!(
             headers_read.as_ref().unwrap().request_type,
-            RequestType::Delete
+            RequestType::Put
         );
     }
 
@@ -435,7 +448,7 @@ mod tests {
 
 /* Test cases:
     1. Ok
-        1. Headers
+        1. Headers -> done
         2. Payload Different types -> done
     2. First 4 bytes are not the magic bytes -> done
     3. Wrong payload
@@ -445,5 +458,4 @@ mod tests {
     4. Unsupported version -> done
     5. Unknown request type
     6. payload too large
-
 */

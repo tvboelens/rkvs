@@ -5,12 +5,12 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tcp_protocol::{TcpError, TcpRequest, TcpResponse, recv_tcp_request};
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-use crate::storage_engine::{StorageEngine, WriteData, WriteJob};
+use crate::storage_engine::{StorageEngine, Store, WriteData, WriteJob};
 
 pub struct Server {
     storage_engine: Arc<StorageEngine>,
@@ -40,18 +40,24 @@ pub enum StorageEngineError {
     Shutdown,
 }
 
-async fn handle_tcp_request(
+async fn handle_tcp_request<T>(
     tcp_request: TcpRequest,
-    storage_engine: Arc<StorageEngine>,
-) -> Result<Option<String>, ServerError> {
+    storage_engine: Arc<T>,
+) -> Result<Option<String>, ServerError>
+where
+    T: Store,
+{
     let op = Operation::from(tcp_request);
     Ok(call_storage_engine(op, storage_engine).await?)
 }
 
-async fn call_storage_engine(
+async fn call_storage_engine<T>(
     op: Operation,
-    storage_engine: Arc<StorageEngine>,
-) -> Result<Option<String>, StorageEngineError> {
+    storage_engine: Arc<T>,
+) -> Result<Option<String>, StorageEngineError>
+where
+    T: Store,
+{
     match op {
         Operation::Delete(key) => {
             let (tx, rx) = oneshot::channel();
@@ -91,23 +97,34 @@ async fn call_storage_engine(
     }
 }
 
-async fn send_response(socket: &mut TcpStream, value: Option<String>, correlation_id: &Uuid) {
+async fn send_response<T>(writer: &mut T, value: Option<String>, correlation_id: &Uuid)
+where
+    T: AsyncWriteExt + Unpin,
+{
     let bytes = TcpResponse::from(correlation_id, value).to_bytes();
-    socket.write_all(&bytes).await.unwrap_or(())
+    writer.write_all(&bytes).await.unwrap_or(())
 }
 
-async fn send_error_response(socket: &mut TcpStream, error: &ServerError, correlation_id: &Uuid) {
+async fn send_error_response<T>(writer: &mut T, error: &ServerError, correlation_id: &Uuid)
+where
+    T: AsyncWriteExt + Unpin,
+{
     let bytes = TcpResponse::from_error(correlation_id, error).to_bytes();
-    socket.write_all(&bytes).await.unwrap_or(())
+    writer.write_all(&bytes).await.unwrap_or(())
 }
 
-async fn process_socket(mut socket: TcpStream, storage_engine_ptr: Arc<StorageEngine>) {
-    match recv_tcp_request(&mut socket).await {
+async fn process_socket<T, U, V>(mut reader: T, mut writer: U, storage_engine_ptr: Arc<V>)
+where
+    T: AsyncReadExt + Unpin,
+    U: AsyncWriteExt + Unpin,
+    V: Store,
+{
+    match recv_tcp_request(&mut reader).await {
         Ok(request) => {
             let correlation_id = request.headers.correlation_id;
             match handle_tcp_request(request, storage_engine_ptr).await {
-                Ok(res) => send_response(&mut socket, res, &correlation_id).await,
-                Err(e) => send_error_response(&mut socket, &e, &correlation_id).await,
+                Ok(res) => send_response(&mut writer, res, &correlation_id).await,
+                Err(e) => send_error_response(&mut writer, &e, &correlation_id).await,
             }
         }
         Err(e) => match e {
@@ -120,7 +137,7 @@ async fn process_socket(mut socket: TcpStream, storage_engine_ptr: Arc<StorageEn
             | tcp_protocol::TcpError::UnknownFlags(id)
             | tcp_protocol::TcpError::UnsupportedVersion(id) => {
                 let error = ServerError::TcpError(e);
-                send_error_response(&mut socket, &error, &id).await
+                send_error_response(&mut writer, &error, &id).await
             }
         }, // Log error?
     }
@@ -128,11 +145,14 @@ async fn process_socket(mut socket: TcpStream, storage_engine_ptr: Arc<StorageEn
 
 impl Server {
     pub async fn run(&self) -> io::Result<()> {
-        let listener = TcpListener::bind(self.address).await?;
+        let listener: TcpListener = TcpListener::bind(self.address).await?;
         loop {
-            let (socket, _) = listener.accept().await?;
+            let (mut socket, _) = listener.accept().await?;
             let storage_engine_ptr = self.storage_engine.clone();
-            tokio::spawn(async move { process_socket(socket, storage_engine_ptr).await });
+            tokio::spawn(async move {
+                let (reader, writer) = socket.split();
+                process_socket(reader, writer, storage_engine_ptr).await
+            });
         }
         Ok(())
     }
