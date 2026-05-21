@@ -204,3 +204,108 @@ impl ServerError {
         }
     }
 }
+
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::storage_engine::{Store, WriteData, WriteJob};
+    use std::sync::mpsc::{Receiver, SendError, Sender, channel};
+    use tokio::sync::oneshot;
+
+    struct ReadJob {
+        key: String,
+        sender: oneshot::Sender<Option<String>>,
+    }
+
+    enum Job {
+        Write(WriteJob),
+        Read(ReadJob),
+    }
+    struct FakeStorageEngine {
+        sender: Sender<Job>,
+    }
+
+    struct FakeWorker {
+        map: HashMap<String, String>,
+        receiver: Receiver<Job>,
+    }
+
+    impl FakeStorageEngine {
+        fn new() -> Self {
+            let (tx, rx) = channel();
+            let mut worker = FakeWorker::new(rx);
+            let _ = std::thread::spawn(move || worker.run());
+            FakeStorageEngine { sender: tx }
+        }
+    }
+
+    impl FakeWorker {
+        pub fn new(rx: Receiver<Job>) -> Self {
+            FakeWorker {
+                map: HashMap::new(),
+                receiver: rx,
+            }
+        }
+
+        pub fn run(&mut self) {
+            while let Ok(msg) = self.receiver.recv() {
+                match msg {
+                    Job::Read(job) => job.sender.send(self.get(&job.key)).unwrap_or(()),
+                    Job::Write(job) => match job.data {
+                        WriteData::Delete(key) => {
+                            job.sender.send(Ok(self.delete(&key))).unwrap_or(())
+                        }
+                        WriteData::Put(data) => job
+                            .sender
+                            .send(Ok(self.put(&data.key, &data.value)))
+                            .unwrap_or(()),
+                    },
+                };
+            }
+        }
+
+        fn delete(&mut self, key: &String) -> Option<String> {
+            self.map.remove(key)
+        }
+
+        fn get(&self, key: &String) -> Option<String> {
+            self.map.get(key).cloned()
+        }
+
+        fn put(&mut self, key: &String, value: &String) -> Option<String> {
+            self.map.insert(key.clone(), value.clone())
+        }
+    }
+
+    impl Store for FakeStorageEngine {
+        fn get(&self, key: &String) -> Option<String> {
+            let (tx, rx) = oneshot::channel();
+            let job = ReadJob {
+                key: key.clone(),
+                sender: tx,
+            };
+            self.sender.send(Job::Read(job)).unwrap_or(());
+            rx.blocking_recv().unwrap_or(None)
+        }
+
+        fn submit_delete(&self, job: WriteJob) -> Result<(), SendError<WriteJob>> {
+            match self.sender.send(Job::Write(job)) {
+                Ok(()) => Ok(()),
+                Err(e) => match e.0 {
+                    Job::Read(_) => Ok(()),
+                    Job::Write(job) => Err(SendError(job)),
+                },
+            }
+        }
+
+        fn submit_put(&self, job: WriteJob) -> Result<(), SendError<WriteJob>> {
+            match self.sender.send(Job::Write(job)) {
+                Ok(()) => Ok(()),
+                Err(e) => match e.0 {
+                    Job::Read(_) => Ok(()),
+                    Job::Write(job) => Err(SendError(job)),
+                },
+            }
+        }
+    }
+}
