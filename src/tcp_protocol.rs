@@ -26,13 +26,15 @@ pub enum RequestType {
     Delete,
 }
 
+#[derive(Debug, PartialEq)]
 pub struct TcpHeaders {
     pub request_type: RequestType,
     pub correlation_id: Uuid,
-    protocol_version: u8,
-    flags: u16,
+    pub protocol_version: u8,
+    pub flags: u16,
 }
 
+#[derive(Debug, PartialEq)]
 pub struct Payload {
     pub key: String,
     pub value: Option<String>,
@@ -168,6 +170,21 @@ impl From<io::Error> for TcpError {
     }
 }
 
+impl TcpRequest {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.resize(8, 0);
+        let header_len: u32 = <usize as TryInto<u32>>::try_into(self.headers.len()).unwrap() + 4; // account for magic bytes
+        bytes[0..4].copy_from_slice(&header_len.to_be_bytes());
+        bytes[4..8].copy_from_slice(&MAGIC_BYTES);
+        bytes.append(&mut self.headers.to_bytes().to_vec());
+        let payload_len: u32 = self.payload.len().try_into().unwrap();
+        bytes.append(&mut payload_len.to_be_bytes().to_vec());
+        bytes.append(&mut self.payload.to_bytes().to_vec());
+        bytes
+    }
+}
+
 impl TcpResponse {
     pub fn from_error(correlation_id: &Uuid, error: &ServerError) -> Self {
         TcpResponse {
@@ -187,20 +204,20 @@ impl TcpResponse {
 
     pub fn len(&self) -> usize {
         match &self.payload {
-            Some(str) => str.len() + 5,
-            None => 5,
+            Some(str) => str.len() + 17,
+            None => 17,
         }
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::<u8>::new();
         buf.resize(self.len(), 0);
-        buf[0..4].copy_from_slice(self.correlation_id.as_bytes());
-        buf[4] = self.response_code;
+        buf[0..16].copy_from_slice(self.correlation_id.as_bytes());
+        buf[16] = self.response_code;
         match &self.payload {
             None => buf,
             Some(str) => {
-                buf[5..].copy_from_slice(str.as_bytes());
+                buf[17..].copy_from_slice(str.as_bytes());
                 buf
             }
         }
@@ -248,11 +265,20 @@ impl Payload {
         }
         buf
     }
+    pub fn len(&self) -> usize {
+        match &self.value {
+            Some(value) => 8 + self.key.len() + value.len(),
+            None => 4 + self.key.len(),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RequestType, TcpError, TcpHeaders, parse_headers};
+    use super::{
+        MAGIC_BYTES, Payload, RequestType, TcpError, TcpHeaders, TcpRequest, parse_headers,
+        parse_payload,
+    };
     use uuid::Uuid;
 
     #[test]
@@ -265,7 +291,7 @@ mod tests {
         };
         let mut buf = Vec::<u8>::new();
         buf.resize(headers_write.len() + 4, 0);
-        buf[0..4].copy_from_slice(&super::MAGIC_BYTES);
+        buf[0..4].copy_from_slice(&MAGIC_BYTES);
         buf[4..].copy_from_slice(&headers_write.to_bytes());
         let headers_read = parse_headers(&buf);
         assert!(headers_read.is_ok());
@@ -288,7 +314,7 @@ mod tests {
         };
         let mut buf = Vec::<u8>::new();
         buf.resize(headers_write.len() + 4, 0);
-        buf[0..4].copy_from_slice(&super::MAGIC_BYTES);
+        buf[0..4].copy_from_slice(&MAGIC_BYTES);
         buf[4..].copy_from_slice(&headers_write.to_bytes());
         let headers_read = parse_headers(&buf);
         assert!(headers_read.is_ok());
@@ -311,7 +337,7 @@ mod tests {
         };
         let mut buf = Vec::<u8>::new();
         buf.resize(headers_write.len() + 4, 0);
-        buf[0..4].copy_from_slice(&super::MAGIC_BYTES);
+        buf[0..4].copy_from_slice(&MAGIC_BYTES);
         buf[4..].copy_from_slice(&headers_write.to_bytes());
         let headers_read = parse_headers(&buf);
         assert!(headers_read.is_ok());
@@ -337,7 +363,7 @@ mod tests {
         };
         let mut buf = Vec::<u8>::new();
         buf.resize(headers_write.len() + 4, 0);
-        buf[0..4].copy_from_slice(&super::MAGIC_BYTES);
+        buf[0..4].copy_from_slice(&MAGIC_BYTES);
         buf[4..].copy_from_slice(&headers_write.to_bytes());
         let headers_read = parse_headers(&buf);
         assert!(matches!(headers_read, Err(TcpError::UnsupportedVersion(_))))
@@ -354,14 +380,12 @@ mod tests {
         };
         let mut buf = Vec::<u8>::new();
         buf.resize(headers_write.len() + 4, 0);
-        buf[0..4].copy_from_slice(&super::MAGIC_BYTES);
+        buf[0..4].copy_from_slice(&MAGIC_BYTES);
         buf[0] += 1;
         buf[4..].copy_from_slice(&headers_write.to_bytes());
         let headers_read = parse_headers(&buf);
         assert!(matches!(headers_read, Err(TcpError::WrongMagicBytes)));
     }
-
-    use super::{Payload, parse_payload};
 
     #[test]
     fn parse_payload_delete_ok() {
@@ -444,6 +468,44 @@ mod tests {
         let payload = parse_payload(&buf, &RequestType::Delete, &correlation_id);
         assert!(matches!(payload, Err(TcpError::MalformedPayload(_))));
     }
+
+    fn parse_tcp_request(bytes: &Vec<u8>) -> Result<TcpRequest, TcpError> {
+        let header_len = u32::from_be_bytes(*bytes[0..4].as_array().unwrap());
+        let header_len_usize = usize::try_from(header_len).unwrap();
+        let headers = parse_headers(&bytes[4..4 + header_len_usize].to_vec())?;
+        let payload = parse_payload(
+            &bytes[8 + header_len_usize..].to_vec(),
+            &headers.request_type,
+            &headers.correlation_id,
+        )?;
+        Ok(TcpRequest {
+            headers: headers,
+            payload: payload,
+        })
+    }
+
+    #[test]
+    fn serialize_request_no_value() {
+        let headers = TcpHeaders {
+            correlation_id: Uuid::from_u128(1024),
+            request_type: RequestType::Get,
+            protocol_version: 0,
+            flags: 0,
+        };
+        let payload = Payload {
+            key: String::from("key"),
+            value: None,
+        };
+        let request = TcpRequest {
+            headers: headers,
+            payload: payload,
+        };
+        let bytes = request.to_bytes();
+        let request_read = parse_tcp_request(&bytes);
+        assert!(matches!(request_read, Ok(_)));
+        assert_eq!(request_read.as_ref().unwrap().headers, request.headers);
+        assert_eq!(request_read.as_ref().unwrap().payload, request.payload);
+    }
 }
 
 /* Test cases:
@@ -458,4 +520,7 @@ mod tests {
     4. Unsupported version -> done
     5. Unknown request type
     6. payload too large
+    7. Response:
+        1. length correct with and without payload
+        2. Correct (de)serialization
 */
