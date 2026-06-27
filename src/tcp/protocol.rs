@@ -1,4 +1,4 @@
-use super::ServerError;
+use super::connection::ServerError;
 use std::io;
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
