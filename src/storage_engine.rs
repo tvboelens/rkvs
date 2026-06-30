@@ -15,7 +15,7 @@ pub trait Store {
     fn put(
         &self,
         key: &String,
-        value: &String,
+        value: String,
     ) -> impl std::future::Future<Output = Result<Option<String>, StorageEngineError>> + Send;
     fn delete(
         &self,
@@ -73,13 +73,9 @@ impl Store for StorageEngine {
         }
     }
 
-    async fn put(
-        &self,
-        key: &String,
-        value: &String,
-    ) -> Result<Option<String>, StorageEngineError> {
+    async fn put(&self, key: &String, value: String) -> Result<Option<String>, StorageEngineError> {
         let (tx, rx) = channel();
-        let cmd = Command::Put(key.clone(), value.clone());
+        let cmd = Command::Put(key.clone(), value);
         let job = Job {
             command: cmd,
             sender: tx,
@@ -148,9 +144,9 @@ impl Worker {
                 },
                 Ok(job) => {
                     let res = match job.command {
-                        Command::Delete(key) => self.do_delete(key),
+                        Command::Delete(key) => self.do_delete(&key),
                         Command::Get(key) => Ok(self.do_get(&key)),
-                        Command::Put(key, value) => self.do_put(&key, &value),
+                        Command::Put(key, value) => self.do_put(key, value),
                     };
                     elapsed -= Instant::now() - last_sync;
                     if elapsed.is_zero() {
@@ -164,26 +160,26 @@ impl Worker {
         }
     }
 
-    fn do_delete(&mut self, key: String) -> Result<Option<String>, std::io::Error> {
+    fn do_delete(&mut self, key: &String) -> Result<Option<String>, std::io::Error> {
         let entry = wal::WalEntry {
             operation_type: wal::OpType::Delete,
             key: key.clone(),
-            value: String::new(),
+            value: None,
             sequence_number: self.wal.last_sequence_number() + 1,
         };
         self.wal.append(&entry)?;
-        Ok(self.memtable.delete(&key))
+        Ok(self.memtable.delete(key))
     }
 
-    fn do_put(&mut self, key: &String, value: &String) -> Result<Option<String>, std::io::Error> {
+    fn do_put(&mut self, key: String, value: String) -> Result<Option<String>, std::io::Error> {
         let entry = wal::WalEntry {
             operation_type: wal::OpType::Put,
             key: key.clone(),
-            value: value.clone(),
+            value: Some(value.clone()),
             sequence_number: self.wal.last_sequence_number() + 1,
         };
         self.wal.append(&entry)?;
-        Ok(self.memtable.put(key.clone(), value.clone()))
+        Ok(self.memtable.put(key, value))
     }
 
     fn do_get(&self, key: &String) -> Option<String> {
@@ -194,5 +190,15 @@ impl Worker {
 impl From<SendError<Job>> for StorageEngineError {
     fn from(_: SendError<Job>) -> Self {
         StorageEngineError::Shutdown
+    }
+}
+
+impl StorageEngineError {
+    pub fn to_rc(&self) -> u8 {
+        match self {
+            StorageEngineError::IoError => 1,
+            StorageEngineError::NotFound => 2,
+            StorageEngineError::Shutdown => 3,
+        }
     }
 }

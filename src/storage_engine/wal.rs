@@ -42,7 +42,7 @@ methods:
 pub struct WalEntry {
     pub operation_type: OpType,
     pub key: String,
-    pub value: String,
+    pub value: Option<String>,
     pub sequence_number: u64,
 }
 
@@ -102,7 +102,10 @@ impl Wal {
             return Err(SerError::InvalidKey);
         }
         // type 2 bytes and sequence number 4 bytes
-        let buf_size: usize = HEADER_SIZE + 6 + entry.key.len() + entry.value.len();
+        let buf_size: usize = match entry.value.as_ref() {
+            None => HEADER_SIZE + 6 + entry.key.len(),
+            Some(value) => HEADER_SIZE + 6 + entry.key.len() + value.len(),
+        };
         let mut buf: Vec<u8> = Vec::new();
         buf.resize(buf_size, 0);
         let mut offset = HEADER_SIZE;
@@ -119,7 +122,11 @@ impl Wal {
         offset = offset + 2;
         buf[offset..offset + entry.key.len()].copy_from_slice(entry.key.as_bytes());
         offset = offset + entry.key.len();
-        buf[offset..offset + entry.value.len()].copy_from_slice(entry.value.as_bytes());
+        if entry.value.is_some() {
+            buf[offset..offset + entry.value.as_ref().unwrap().len()]
+                .copy_from_slice(entry.value.as_ref().unwrap().as_bytes());
+        }
+
         buf[buf_size - 4..buf_size].copy_from_slice(&entry.sequence_number.to_le_bytes());
 
         let checksum = Wal::calculate_checksum(&buf[HEADER_SIZE..buf_size]);
