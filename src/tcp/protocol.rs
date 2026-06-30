@@ -1,4 +1,4 @@
-use super::connection::ServerError;
+use crate::storage_engine::StorageEngineError;
 use std::io;
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
@@ -6,10 +6,21 @@ use uuid::Uuid;
 static PROTOCOL_VERSION: u8 = 0;
 static MAGIC_BYTES: [u8; 4] = [0x72, 0x6B, 0x76, 0x73]; //rkvs
 
+/*
+TODO:
+1. Probably need a separate error for timeout when receiving header/payload and for idle connection timeout
+2. Test serialization of new tcp errors and of storage engine errors
+
+*/
+
 #[derive(Debug)]
 pub enum TcpError {
-    IoError(io::Error),
-    WrongMagicBytes,
+    Connection(ConnectionError),
+    Parse(ParseError),
+}
+
+#[derive(Debug)]
+pub enum ParseError {
     UnsupportedVersion(Uuid),
     InvalidRequestType(Uuid),
     MissingValue(Uuid), // only for put
@@ -17,6 +28,13 @@ pub enum TcpError {
     InvalidValue(Uuid),
     UnknownFlags(Uuid),
     MalformedPayload(Uuid), // general errors
+}
+
+#[derive(Debug)]
+pub enum ConnectionError {
+    IoError(io::Error),
+    WrongMagicBytes,
+    TimedOut,
 }
 
 #[derive(Debug, PartialEq)]
@@ -66,15 +84,17 @@ fn parse_request_type(n: u8) -> Result<RequestType, ()> {
 
 fn parse_headers(buf: &Vec<u8>) -> Result<TcpHeaders, TcpError> {
     if !verify_magic_bytes(&buf[0..4].try_into().unwrap()) {
-        return Err(TcpError::WrongMagicBytes);
+        return Err(TcpError::from(ConnectionError::WrongMagicBytes));
     }
     let correlation_id = Uuid::from_bytes(buf[4..20].try_into().unwrap());
     let version = buf[20];
     if version > PROTOCOL_VERSION {
-        return Err(TcpError::UnsupportedVersion(correlation_id));
+        return Err(TcpError::from(ParseError::UnsupportedVersion(
+            correlation_id,
+        )));
     }
     let request_type =
-        parse_request_type(buf[21]).map_err(|_| TcpError::InvalidRequestType(correlation_id))?;
+        parse_request_type(buf[21]).map_err(|_| ParseError::InvalidRequestType(correlation_id))?;
     let flags = u16::from_be_bytes(buf[22..24].try_into().unwrap());
 
     // TODO: optional headers
@@ -95,17 +115,17 @@ fn parse_payload(
     let key_len_u32 = u32::from_be_bytes(buf[0..4].try_into().unwrap());
     let key_len = usize::try_from(key_len_u32).unwrap();
     let key = String::from_utf8(buf[4..key_len + 4].to_vec())
-        .map_err(|_| TcpError::InvalidKey(*correlation_id))?;
+        .map_err(|_| ParseError::InvalidKey(*correlation_id))?;
     match request_type {
         RequestType::Put => {
             if key_len >= payload_len - 4 {
-                Err(TcpError::MissingValue(*correlation_id))
+                Err(TcpError::from(ParseError::MissingValue(*correlation_id)))
             } else {
                 let value_len_u32 =
                     u32::from_be_bytes(buf[key_len + 4..key_len + 8].try_into().unwrap());
                 let value_len = usize::try_from(value_len_u32).unwrap();
                 let value = String::from_utf8(buf[key_len + 8..key_len + 8 + value_len].to_vec())
-                    .map_err(|_| TcpError::InvalidValue(*correlation_id))?;
+                    .map_err(|_| ParseError::InvalidValue(*correlation_id))?;
                 Ok(Payload {
                     key: key,
                     value: Some(value),
@@ -114,7 +134,9 @@ fn parse_payload(
         }
         _ => {
             if key_len < payload_len - 4 {
-                Err(TcpError::MalformedPayload(*correlation_id))
+                Err(TcpError::from(ParseError::MalformedPayload(
+                    *correlation_id,
+                )))
             } else {
                 Ok(Payload {
                     key: key,
@@ -132,7 +154,6 @@ where
     let mut buf = Vec::<u8>::new();
     let header_len: usize = usize::try_from(*len).unwrap();
     buf.resize(header_len, 0);
-
     let _ = reader.read_exact(&mut buf).await?;
     Ok(buf)
 }
@@ -149,11 +170,10 @@ where
     Ok(buf)
 }
 
-pub async fn recv_tcp_request<T>(stream: &mut T) -> Result<TcpRequest, TcpError>
+pub async fn recv_tcp_request<T>(stream: &mut T, header_len: u32) -> Result<TcpRequest, TcpError>
 where
     T: AsyncReadExt + Unpin,
 {
-    let header_len = stream.read_u32().await?;
     let headers = recv_headers(stream, &header_len)
         .await
         .and_then(|buf| parse_headers(&buf))?;
@@ -164,9 +184,21 @@ where
     Ok(TcpRequest { headers, payload })
 }
 
+impl From<ParseError> for TcpError {
+    fn from(value: ParseError) -> Self {
+        TcpError::Parse(value)
+    }
+}
+
+impl From<ConnectionError> for TcpError {
+    fn from(value: ConnectionError) -> Self {
+        TcpError::Connection(value)
+    }
+}
+
 impl From<io::Error> for TcpError {
     fn from(value: io::Error) -> Self {
-        TcpError::IoError(value)
+        TcpError::Connection(ConnectionError::IoError(value))
     }
 }
 
@@ -186,10 +218,20 @@ impl TcpRequest {
 }
 
 impl TcpResponse {
-    pub fn from_error(correlation_id: &Uuid, error: &ServerError) -> Self {
+    pub fn from_internal_error(correlation_id: &Uuid, error: &StorageEngineError) -> Self {
         TcpResponse {
             correlation_id: *correlation_id,
             response_code: error.to_rc(),
+            payload: None,
+        }
+    }
+
+    pub fn from_tcp_parse_error(error: ParseError) -> Self {
+        let correlation_id = error.extract_correlation_id();
+        let e = TcpError::from(error);
+        TcpResponse {
+            correlation_id: correlation_id,
+            response_code: e.to_rc(),
             payload: None,
         }
     }
@@ -199,6 +241,15 @@ impl TcpResponse {
             correlation_id: *correlation_id,
             response_code: 0,
             payload: value,
+        }
+    }
+
+    pub fn create_close_notification() -> Self {
+        let error = TcpError::from(ConnectionError::TimedOut);
+        TcpResponse {
+            correlation_id: uuid::Uuid::nil(),
+            response_code: error.to_rc(),
+            payload: None,
         }
     }
 
@@ -273,11 +324,46 @@ impl Payload {
     }
 }
 
+impl TcpError {
+    pub fn to_rc(&self) -> u8 {
+        match self {
+            Self::Parse(e) => match e {
+                ParseError::InvalidKey(_) => 4,
+                ParseError::InvalidValue(_) => 5,
+                ParseError::MissingValue(_) => 6,
+                ParseError::MalformedPayload(_) => 7,
+                ParseError::InvalidRequestType(_) => 8,
+                ParseError::UnknownFlags(_) => 9,
+                ParseError::UnsupportedVersion(_) => 10,
+            },
+            Self::Connection(e) => match e {
+                ConnectionError::IoError(_) => 255,
+                ConnectionError::TimedOut => 11,
+                ConnectionError::WrongMagicBytes => 255,
+            },
+        }
+    }
+}
+
+impl ParseError {
+    pub fn extract_correlation_id(&self) -> Uuid {
+        match self {
+            ParseError::InvalidKey(c)
+            | ParseError::InvalidRequestType(c)
+            | ParseError::InvalidValue(c)
+            | ParseError::MalformedPayload(c)
+            | ParseError::MissingValue(c)
+            | ParseError::UnknownFlags(c)
+            | ParseError::UnsupportedVersion(c) => c.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        MAGIC_BYTES, Payload, RequestType, TcpError, TcpHeaders, TcpRequest, parse_headers,
-        parse_payload,
+        ConnectionError, MAGIC_BYTES, ParseError, Payload, RequestType, TcpError, TcpHeaders,
+        TcpRequest, parse_headers, parse_payload,
     };
     use uuid::Uuid;
 
@@ -366,7 +452,10 @@ mod tests {
         buf[0..4].copy_from_slice(&MAGIC_BYTES);
         buf[4..].copy_from_slice(&headers_write.to_bytes());
         let headers_read = parse_headers(&buf);
-        assert!(matches!(headers_read, Err(TcpError::UnsupportedVersion(_))))
+        assert!(matches!(
+            headers_read,
+            Err(TcpError::Parse(ParseError::UnsupportedVersion(_)))
+        ))
     }
 
     #[test]
@@ -384,7 +473,10 @@ mod tests {
         buf[0] += 1;
         buf[4..].copy_from_slice(&headers_write.to_bytes());
         let headers_read = parse_headers(&buf);
-        assert!(matches!(headers_read, Err(TcpError::WrongMagicBytes)));
+        assert!(matches!(
+            headers_read,
+            Err(TcpError::Connection(ConnectionError::WrongMagicBytes))
+        ));
     }
 
     #[test]
@@ -442,7 +534,10 @@ mod tests {
         let buf = payload_write.to_bytes();
         let correlation_id = Uuid::from_u128(20);
         let payload = parse_payload(&buf, &RequestType::Put, &correlation_id);
-        assert!(matches!(payload, Err(TcpError::MissingValue(_))));
+        assert!(matches!(
+            payload,
+            Err(TcpError::Parse(ParseError::MissingValue(_)))
+        ));
     }
 
     #[test]
@@ -454,7 +549,10 @@ mod tests {
         let buf = payload_write.to_bytes();
         let correlation_id = Uuid::from_u128(20);
         let payload = parse_payload(&buf, &RequestType::Get, &correlation_id);
-        assert!(matches!(payload, Err(TcpError::MalformedPayload(_))));
+        assert!(matches!(
+            payload,
+            Err(TcpError::Parse(ParseError::MalformedPayload(_)))
+        ));
     }
 
     #[test]
@@ -466,7 +564,10 @@ mod tests {
         let buf = payload_write.to_bytes();
         let correlation_id = Uuid::from_u128(20);
         let payload = parse_payload(&buf, &RequestType::Delete, &correlation_id);
-        assert!(matches!(payload, Err(TcpError::MalformedPayload(_))));
+        assert!(matches!(
+            payload,
+            Err(TcpError::Parse(ParseError::MalformedPayload(_)))
+        ));
     }
 
     fn parse_tcp_request(bytes: &Vec<u8>) -> Result<TcpRequest, TcpError> {

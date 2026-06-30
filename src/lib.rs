@@ -9,15 +9,22 @@ use tcp::connection_manager::ConnectionManager;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
+use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::storage_engine::StorageEngine;
 use crate::tcp::connection::ConnectionHandleData;
 
+/*
+TODO:
+1. Determine a good duration for connection timeouts or get it from config
+2. set maximum request size and reject if exceeded
+*/
+
 pub struct Server {
     storage_engine: Arc<StorageEngine>,
     address: SocketAddr,
-    stop: CancellationToken,
+    do_cancel: CancellationToken,
     sender: Sender<ConnectionData>,
     connection_manager_handle: JoinHandle<()>,
     cancellation_token: CancellationToken,
@@ -32,7 +39,7 @@ async fn start_connection(
 ) {
     let (reader, writer) = socket.split();
     let mut connection = TcpConnection::new(conn_id, sender, reader, writer, storage_engine, token);
-    connection.start().await
+    connection.start(Duration::from_secs(120)).await
 }
 
 impl Server {
@@ -49,7 +56,7 @@ impl Server {
         Server {
             storage_engine: storage_engine,
             address: addr,
-            stop: token,
+            do_cancel: token,
             sender: tx,
             connection_manager_handle: handle,
             cancellation_token: CancellationToken::new(),
@@ -58,7 +65,7 @@ impl Server {
     pub async fn run(self) -> io::Result<()> {
         let mut last_conn_id: u64 = 0;
         let listener: TcpListener = TcpListener::bind(self.address).await?;
-        while !self.stop.is_cancelled() {
+        while !self.do_cancel.is_cancelled() {
             let (socket, _) = listener.accept().await?;
             let storage_engine_ptr = self.storage_engine.clone();
             let sender = self.sender.clone();

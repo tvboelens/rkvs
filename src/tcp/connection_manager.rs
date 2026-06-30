@@ -39,3 +39,9 @@ impl ConnectionManager {
         }
     }
 }
+/*
+test cases
+1. request completes when cancel happens after starting recv
+2. when starting multiple requests in tasks, they are not killed until connection manager run completes
+3. panics in the request tasks
+*/
