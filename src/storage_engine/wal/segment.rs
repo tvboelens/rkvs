@@ -168,9 +168,11 @@ impl WalEntry {
         match self.operation_type {
             OpType::Put => {
                 buf[offset] = 1;
+                assert!(self.value.is_some());
             }
             OpType::Delete => {
                 buf[offset] = 2;
+                assert!(self.value.is_none());
             }
         }
         offset += 1;
@@ -268,5 +270,41 @@ mod tests {
         assert_eq!(read_entry.sequence_number, write_entry.sequence_number);
         assert_eq!(read_entry.operation_type, write_entry.operation_type);
         assert_eq!(read_entry.value, write_entry.value);
+    }
+
+    #[test]
+    #[should_panic]
+    fn serde_wal_entry_missing_key() {
+        let write_entry = WalEntry {
+            operation_type: OpType::Put,
+            key: String::new(),
+            value: Some(String::from("value")),
+            sequence_number: 1024,
+        };
+        let _ = write_entry.to_bytes();
+    }
+
+    #[test]
+    #[should_panic]
+    fn serde_wal_entry_put_missing_value() {
+        let write_entry = WalEntry {
+            operation_type: OpType::Put,
+            key: String::from("key"),
+            value: None,
+            sequence_number: 1024,
+        };
+        let _ = write_entry.to_bytes();
+    }
+
+    #[test]
+    #[should_panic]
+    fn serde_wal_entry_delete_value_panic() {
+        let write_entry = WalEntry {
+            operation_type: OpType::Delete,
+            key: String::from("key"),
+            value: Some(String::from("value")),
+            sequence_number: 1024,
+        };
+        let _ = write_entry.to_bytes();
     }
 }
