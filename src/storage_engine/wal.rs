@@ -1,31 +1,13 @@
-use ::std::mem::size_of;
-use crc;
-use std::fs::File;
-use std::io::{Error, ErrorKind, Write};
+pub mod segment;
 
-pub enum OpType {
-    Put,
-    Delete,
-}
+use ::std::io;
+use segment::{Segment, WalEntry, determine_segment_filename};
+use std::path::PathBuf;
 
 enum SerError {
     InvalidKey,
     InvalidValue,
 }
-
-// length 4 bytes checksum 4 bytes
-static HEADER_SIZE: usize = size_of::<usize>() + size_of::<u32>();
-// crc32 with Castagnoli polynomial
-static CHECKSUM_ALG: crc::Algorithm<u32> = crc::Algorithm {
-    width: 32,
-    poly: 0x1edc6f41,
-    init: 0xffffffff,
-    refin: true,
-    refout: true,
-    xorout: 0xffffffff,
-    residue: 0xb798b438,
-    check: 0xe3069283,
-};
 
 /*
 methods:
@@ -39,36 +21,42 @@ methods:
 6. Do I need synchronization or do we let the storage engine itself handle this?
 */
 
-pub struct WalEntry {
-    pub operation_type: OpType,
-    pub key: String,
-    pub value: Option<String>,
-    pub sequence_number: u64,
-}
-
 pub struct Wal {
-    file: File,
-    file_size: u64, // might need to convert to atomic
+    active_segment: Segment,
     last_sequence_number: u64,
+    last_no_of_bytes_written: u32,
+    segment_max_size: u32,
+    dir: PathBuf,
 }
 
 impl Wal {
-    pub fn from(sequence_number: u64) -> Self {
-        let path = sequence_number.to_string();
-        let file = File::create(path).unwrap();
-        Wal {
-            file: file,
-            file_size: 0,
-            last_sequence_number: sequence_number,
-        }
+    pub fn create_new(dir: PathBuf, segment_max_size: u32) -> io::Result<Self> {
+        /*
+        1. If we start from scratch, just create the first segment, return and start rw operations
+        2. If WAL files and SSTable present:
+            1. Find highest LSN from SSTable
+            2. Recover everything after this
+                1. Find segment containing this lsn
+                2. Then go to next lsn (possibly in next segment)
+                3. Then call recover()
+         */
+        let filename = PathBuf::from(determine_segment_filename(0, 0, segment_max_size as u64));
+        let path = dir.join(filename);
+        let file = std::fs::File::create(path)?;
+        let segment = Segment::new(file, segment_max_size);
+
+        let wal = Wal {
+            active_segment: segment,
+            last_sequence_number: 0,
+            last_no_of_bytes_written: 0,
+            segment_max_size: segment_max_size,
+            dir: dir,
+        };
+        Ok(wal)
     }
 
     pub fn sync(&self) -> std::io::Result<()> {
-        self.file.sync_all()
-    }
-
-    pub fn size(&self) -> &u64 {
-        &self.file_size
+        self.active_segment.sync()
     }
 
     pub fn last_sequence_number(&self) -> &u64 {
@@ -76,69 +64,81 @@ impl Wal {
     }
 
     pub fn append(&mut self, entry: &WalEntry) -> std::io::Result<()> {
-        match Wal::serialize_entry(entry) {
-            Ok(buf) => {
-                let buf_size = buf.len() as u64;
-                self.file.write_all(buf.as_slice()).map(|_| {
-                    self.last_sequence_number = entry.sequence_number;
-                    self.file_size = self.file_size + buf_size;
-                })
-            }
-            Err(e) => match e {
-                SerError::InvalidKey => Err(Error::new(
-                    ErrorKind::Other,
-                    "Serialization error, invalid key",
-                )),
-                SerError::InvalidValue => Err(Error::new(
-                    ErrorKind::Other,
-                    "Serialization error, invalid value",
-                )),
-            },
+        let buf = entry.to_bytes();
+        let buf_size = buf.len() as u32;
+        let free_space = self.active_segment.remaining_space();
+        if buf_size <= free_space {
+            self.active_segment.append(buf.as_slice())?;
+        } else if segment::HEADER_SIZE as u32 <= free_space {
+            self.active_segment.append(&buf[0..segment::HEADER_SIZE])?;
+            self.active_segment.pad()?;
+            self.rotate(entry.sequence_number + buf_size as u64)?;
+            self.active_segment.append(&buf[segment::HEADER_SIZE..])?;
+        } else {
+            self.active_segment.pad()?;
+            self.rotate(entry.sequence_number + buf_size as u64);
+            self.active_segment.append(buf.as_slice())?;
         }
+        self.last_sequence_number = entry.sequence_number;
+        self.last_no_of_bytes_written = buf_size;
+        // TODO: Is there a possibility of partial writes? If so, truncate
+        Ok(())
     }
 
-    fn serialize_entry(entry: &WalEntry) -> Result<Vec<u8>, SerError> {
-        if entry.key.is_empty() {
-            return Err(SerError::InvalidKey);
-        }
-        // type 2 bytes and sequence number 4 bytes
-        let buf_size: usize = match entry.value.as_ref() {
-            None => HEADER_SIZE + 6 + entry.key.len(),
-            Some(value) => HEADER_SIZE + 6 + entry.key.len() + value.len(),
-        };
-        let mut buf: Vec<u8> = Vec::new();
-        buf.resize(buf_size, 0);
-        let mut offset = HEADER_SIZE;
-        match entry.operation_type {
-            OpType::Put => {
-                let i: u16 = 1;
-                buf[HEADER_SIZE..HEADER_SIZE + 2].copy_from_slice(&i.to_le_bytes());
-            }
-            OpType::Delete => {
-                let i: u16 = 2;
-                buf[HEADER_SIZE..HEADER_SIZE + 2].copy_from_slice(&i.to_le_bytes());
-            }
-        }
-        offset = offset + 2;
-        buf[offset..offset + entry.key.len()].copy_from_slice(entry.key.as_bytes());
-        offset = offset + entry.key.len();
-        if entry.value.is_some() {
-            buf[offset..offset + entry.value.as_ref().unwrap().len()]
-                .copy_from_slice(entry.value.as_ref().unwrap().as_bytes());
-        }
-
-        buf[buf_size - 4..buf_size].copy_from_slice(&entry.sequence_number.to_le_bytes());
-
-        let checksum = Wal::calculate_checksum(&buf[HEADER_SIZE..buf_size]);
-        buf[0..size_of::<usize>()].copy_from_slice(&buf_size.to_le_bytes());
-        buf[size_of::<usize>()..HEADER_SIZE].copy_from_slice(&checksum.to_le_bytes());
-        Ok(buf)
+    pub fn next_sequence_number(&self) -> u64 {
+        self.last_sequence_number + self.last_no_of_bytes_written as u64
     }
 
-    fn calculate_checksum(buf: &[u8]) -> u32 {
-        let crc32 = crc::Crc::<u32>::new(&CHECKSUM_ALG);
-        let mut digest = crc32.digest();
-        digest.update(buf);
-        digest.finalize()
+    fn rotate(&mut self, next_sequence_number: u64) -> io::Result<()> {
+        let segment_size = self.segment_max_size as u64;
+        let filename = determine_segment_filename(0, next_sequence_number, segment_size);
+        let path = self.dir.join(filename);
+        let file = std::fs::File::create(path)?;
+        self.active_segment = Segment::new(file, self.segment_max_size);
+        Ok(())
     }
 }
+/*
+LSN:
+64 bit unsigned int (16 hexadecimals), high part first 32 bits and low part the last 32 bits
+This is the offset of bytes written from the start (i.e. if an entry has LSN x and consists of y bits,
+then the LSN of next entry is x+y)
+The high part signifies the logical log number (each logical log is 2^32 bytes = 4GB)
+Each logical log is divided into segments (1 file per segment) (for example 16MB per file means 4GB/16MB = 256 segments)
+WAL filename now consists of
+timeline_id high_part segment_number
+Each is a 32 bit uint, timeline id comes from the fact that checkpointing and recovery can lead to multiple
+versions (timelines) of the db and we must track all of them (maybe not so relevant right now for me)
+
+Other details:
+segment size is exact, e.g. if configured size is 16 MB, then we write exactly 16 MB before we open the new segment
+
+high part in filename should be the high part of lsn of first record that starts in the file (i.e. if the first bytes belong to
+a record whose start is written into previous file, the next record)
+
+there also seems to be a concept of pages, which seem to be kept in memory
+apparently record headers do not get split across pages (but the payload can be split across),
+instead there is some kind of padding
+even if we don't want to implement this (at first) do we need to pad so that the headers are not split across files?
+*/
+
+/*
+Implementation notes:
+1. Segment is the direct interface to the FS, WAL manages the segments
+2. Right now we need to solve two problems:
+    1. Rollover
+        1. Check before write if we will need to rollover
+            1. rollover_necessary(len) -> returns enum with 2 values
+                1. No
+                2. Yes with no of bytes -> no of bytes we can write, if 0 then call pad()
+        2. If have to rollover check whether we can write the header or have to pad -> see above
+        3. Pad with zeros?
+        4. Open new segment file
+        5. Write bytes to old segment file
+        5. Close the old segment file?
+        6. Write remaining bytes to new segment file
+    2. Do we need to keep open previous WAL files?
+        1. I guess maybe not open, since we only use the WAL for recovering the memtable on restart
+        2. So once the memtable is persisted to the sstable we don't need the old files anymore
+        3. I guess here the question
+*/
