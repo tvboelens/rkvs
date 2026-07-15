@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, Write};
 
-// length 4 bytes checksum 4 bytes key_len 4 bytes and op 2 bytes
-pub static HEADER_SIZE: usize = 3 * size_of::<u32>() + size_of::<u16>();
+// length 4 bytes checksum 4 bytes key_len 4 bytes and op 1 bytes
+pub static HEADER_SIZE: usize = 3 * size_of::<u32>() + size_of::<u8>();
 // crc32 with Castagnoli polynomial
 static CHECKSUM_ALG: crc::Algorithm<u32> = crc::Algorithm {
     width: 32,
@@ -22,6 +22,7 @@ pub struct Segment {
     max_size: u32,
 }
 
+#[derive(Debug, PartialEq)]
 pub enum OpType {
     Put,
     Delete,
@@ -213,7 +214,7 @@ impl WalEntry {
         let key = String::from_utf8(bytes[offset..offset + key_len as usize].to_vec()).unwrap();
         offset += key_len as usize;
         let mut value = None;
-        if offset < bytes.len() {
+        if offset + size_of::<u64>() < bytes.len() {
             u32_buf.copy_from_slice(&bytes[offset..offset + size_of::<u32>()]);
             offset += size_of::<u32>();
             let value_len = u32::from_le_bytes(u32_buf);
@@ -230,5 +231,25 @@ impl WalEntry {
             value: value,
             sequence_number: sequence_number,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OpType, WalEntry};
+    #[test]
+    fn serde_wal_entry_delete_ok() {
+        let write_entry = WalEntry {
+            operation_type: OpType::Delete,
+            key: String::from("key"),
+            value: None,
+            sequence_number: 1024,
+        };
+        let bytes = write_entry.to_bytes();
+        let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..]);
+        assert_eq!(read_entry.key, write_entry.key);
+        assert!(read_entry.value.is_none());
+        assert_eq!(read_entry.sequence_number, write_entry.sequence_number);
+        assert_eq!(read_entry.operation_type, write_entry.operation_type);
     }
 }
