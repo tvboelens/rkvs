@@ -218,8 +218,9 @@ impl WalEntry {
             u32_buf.copy_from_slice(&bytes[offset..offset + size_of::<u32>()]);
             offset += size_of::<u32>();
             let value_len = u32::from_le_bytes(u32_buf);
-            value =
-                Some(String::from_utf8(bytes[offset..offset + key_len as usize].to_vec()).unwrap());
+            value = Some(
+                String::from_utf8(bytes[offset..offset + value_len as usize].to_vec()).unwrap(),
+            );
             offset += value_len as usize;
         }
         let mut u64_buf: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
@@ -251,5 +252,21 @@ mod tests {
         assert!(read_entry.value.is_none());
         assert_eq!(read_entry.sequence_number, write_entry.sequence_number);
         assert_eq!(read_entry.operation_type, write_entry.operation_type);
+    }
+
+    #[test]
+    fn serde_wal_entry_put_ok() {
+        let write_entry = WalEntry {
+            operation_type: OpType::Put,
+            key: String::from("key"),
+            value: Some(String::from("value")),
+            sequence_number: 1024,
+        };
+        let bytes = write_entry.to_bytes();
+        let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..]);
+        assert_eq!(read_entry.key, write_entry.key);
+        assert_eq!(read_entry.sequence_number, write_entry.sequence_number);
+        assert_eq!(read_entry.operation_type, write_entry.operation_type);
+        assert_eq!(read_entry.value, write_entry.value);
     }
 }
