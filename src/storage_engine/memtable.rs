@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 pub struct MemTable {
-    table: HashMap<String, String>,
+    table: HashMap<String, Option<String>>,
 }
 
 impl Clone for MemTable {
@@ -20,15 +20,27 @@ impl MemTable {
     }
 
     pub fn put(&mut self, key: String, value: String) -> Option<String> {
-        self.table.insert(key, value)
+        match self.table.insert(key, Some(value)) {
+            Some(opt) => opt,
+            None => None,
+        }
     }
 
     pub fn get(&self, key: &String) -> Option<String> {
-        self.table.get(key).cloned()
+        match self.table.get(key) {
+            Some(opt) => match opt {
+                Some(v) => Some(v.clone()),
+                None => None,
+            },
+            None => None,
+        }
     }
 
     pub fn delete(&mut self, key: &String) -> Option<String> {
-        self.table.remove(key)
+        match self.table.insert(key.clone(), None) {
+            Some(opt) => opt,
+            None => None,
+        }
     }
 
     pub fn len(&self) -> usize {
