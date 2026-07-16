@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, Write};
+use std::string::FromUtf8Error;
 
 // length 4 bytes checksum 4 bytes key_len 4 bytes and op 1 bytes
 pub static HEADER_SIZE: usize = 3 * size_of::<u32>() + size_of::<u8>();
@@ -26,6 +27,12 @@ pub struct Segment {
 pub enum OpType {
     Put,
     Delete,
+}
+
+#[derive(Debug)]
+pub enum RecoveryError {
+    Io(io::Error),
+    Corrupted,
 }
 
 pub struct WalEntry {
@@ -91,7 +98,7 @@ impl Segment {
         &mut self,
         table: &mut HashMap<String, Option<String>>,
         offset: u32,
-    ) -> io::Result<Option<Vec<u8>>> {
+    ) -> Result<Option<Vec<u8>>, RecoveryError> {
         let mut wal_entries = Vec::<WalEntry>::new();
         let res = self.read_parse_validate(&mut wal_entries, offset);
         for entry in wal_entries {
@@ -111,17 +118,17 @@ impl Segment {
         &mut self,
         entries: &mut Vec<WalEntry>,
         offset: u32,
-    ) -> io::Result<Option<Vec<u8>>> {
+    ) -> Result<Option<Vec<u8>>, RecoveryError> {
         let mut bytes = Vec::<u8>::new();
         self.file.seek(io::SeekFrom::Start(offset as u64))?;
         self.file.read_to_end(&mut bytes)?;
-        Segment::parse_wal_entries(&bytes, entries)
+        Segment::parse_validate_wal_entries(&bytes, entries)
     }
 
-    fn parse_wal_entries(
+    fn parse_validate_wal_entries(
         bytes: &Vec<u8>,
         entries: &mut Vec<WalEntry>,
-    ) -> io::Result<Option<Vec<u8>>> {
+    ) -> Result<Option<Vec<u8>>, RecoveryError> {
         let mut offset: usize = 0;
         let mut record_len: usize = 0;
         let mut u32_buf: [u8; 4] = [0, 0, 0, 0];
@@ -130,7 +137,14 @@ impl Segment {
             record_len = u32::from_le_bytes(u32_buf) as usize;
             offset += 4;
             if offset + record_len <= bytes.len() {
-                let entry = WalEntry::from_bytes(&bytes[offset..offset + record_len]);
+                u32_buf.copy_from_slice(&bytes[offset..offset + 4]);
+                let read_checksum = u32::from_le_bytes(u32_buf);
+                offset += 4;
+                let calculated_checksum = calculate_checksum(&bytes[offset..offset + record_len]);
+                if read_checksum != calculated_checksum {
+                    return Err(RecoveryError::Corrupted);
+                }
+                let entry = WalEntry::from_bytes(&bytes[offset..offset + record_len])?;
                 entries.push(entry);
                 offset += record_len;
             }
@@ -201,7 +215,10 @@ impl WalEntry {
     // mismatching lengths
     // invalid utf8
     // Checksum mismatch
-    fn from_bytes(bytes: &[u8]) -> Self {
+    fn from_bytes(bytes: &[u8]) -> Result<Self, RecoveryError> {
+        if bytes.len() < 1 + size_of::<u32>() {
+            return Err(RecoveryError::Corrupted);
+        }
         let mut u32_buf: [u8; 4] = [0, 0, 0, 0];
         let mut offset: usize = 1;
         let op: OpType;
@@ -213,33 +230,54 @@ impl WalEntry {
         u32_buf.copy_from_slice(&bytes[offset..offset + size_of::<u32>()]);
         let key_len = u32::from_le_bytes(u32_buf);
         offset += size_of::<u32>();
-        let key = String::from_utf8(bytes[offset..offset + key_len as usize].to_vec()).unwrap();
+        if bytes.len() < offset + key_len as usize {
+            return Err(RecoveryError::Corrupted);
+        }
+        let key = String::from_utf8(bytes[offset..offset + key_len as usize].to_vec())?;
         offset += key_len as usize;
         let mut value = None;
         if offset + size_of::<u64>() < bytes.len() {
             u32_buf.copy_from_slice(&bytes[offset..offset + size_of::<u32>()]);
             offset += size_of::<u32>();
             let value_len = u32::from_le_bytes(u32_buf);
-            value = Some(
-                String::from_utf8(bytes[offset..offset + value_len as usize].to_vec()).unwrap(),
-            );
+            if bytes.len() < offset + value_len as usize {
+                return Err(RecoveryError::Corrupted);
+            }
+            value = Some(String::from_utf8(
+                bytes[offset..offset + value_len as usize].to_vec(),
+            )?);
             offset += value_len as usize;
+        }
+        if bytes.len() < offset + 8 {
+            return Err(RecoveryError::Corrupted);
         }
         let mut u64_buf: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
         u64_buf.copy_from_slice(&bytes[offset..]);
         let sequence_number = u64::from_le_bytes(u64_buf);
-        WalEntry {
+        Ok(WalEntry {
             operation_type: op,
             key: key,
             value: value,
             sequence_number: sequence_number,
-        }
+        })
+    }
+}
+
+impl From<io::Error> for RecoveryError {
+    fn from(value: io::Error) -> Self {
+        RecoveryError::Io(value)
+    }
+}
+
+impl From<FromUtf8Error> for RecoveryError {
+    fn from(_: FromUtf8Error) -> Self {
+        RecoveryError::Corrupted
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{OpType, WalEntry};
+    use super::{HEADER_SIZE, OpType, RecoveryError, WalEntry};
     #[test]
     fn serde_wal_entry_delete_ok() {
         let write_entry = WalEntry {
@@ -249,7 +287,7 @@ mod tests {
             sequence_number: 1024,
         };
         let bytes = write_entry.to_bytes();
-        let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..]);
+        let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..]).unwrap();
         assert_eq!(read_entry.key, write_entry.key);
         assert!(read_entry.value.is_none());
         assert_eq!(read_entry.sequence_number, write_entry.sequence_number);
@@ -265,7 +303,7 @@ mod tests {
             sequence_number: 1024,
         };
         let bytes = write_entry.to_bytes();
-        let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..]);
+        let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..]).unwrap();
         assert_eq!(read_entry.key, write_entry.key);
         assert_eq!(read_entry.sequence_number, write_entry.sequence_number);
         assert_eq!(read_entry.operation_type, write_entry.operation_type);
@@ -306,5 +344,109 @@ mod tests {
             sequence_number: 1024,
         };
         let _ = write_entry.to_bytes();
+    }
+
+    #[test]
+    fn serde_wal_entry_put_truncated_key_len() {
+        let write_entry = WalEntry {
+            operation_type: OpType::Put,
+            key: String::from("key"),
+            value: Some(String::from("value")),
+            sequence_number: 1024,
+        };
+        let bytes = write_entry.to_bytes();
+        let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..HEADER_SIZE - 2]);
+        assert!(matches!(read_entry, Err(RecoveryError::Corrupted)));
+    }
+
+    #[test]
+    fn serde_wal_entry_put_truncated_key() {
+        let write_entry = WalEntry {
+            operation_type: OpType::Put,
+            key: String::from("key"),
+            value: Some(String::from("value")),
+            sequence_number: 1024,
+        };
+        let bytes = write_entry.to_bytes();
+        let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..HEADER_SIZE + 1]);
+        assert!(matches!(read_entry, Err(RecoveryError::Corrupted)));
+    }
+
+    #[test]
+    fn serde_wal_entry_put_truncated_value_len() {
+        let write_entry = WalEntry {
+            operation_type: OpType::Put,
+            key: String::from("key"),
+            value: Some(String::from("value")),
+            sequence_number: 1024,
+        };
+        let bytes = write_entry.to_bytes();
+        let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..HEADER_SIZE + 4]);
+        assert!(matches!(read_entry, Err(RecoveryError::Corrupted)));
+    }
+
+    #[test]
+    fn serde_wal_entry_put_truncated_value() {
+        let write_entry = WalEntry {
+            operation_type: OpType::Put,
+            key: String::from("key"),
+            value: Some(String::from("value")),
+            sequence_number: 1024,
+        };
+        let bytes = write_entry.to_bytes();
+        let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..HEADER_SIZE + 8]);
+        assert!(matches!(read_entry, Err(RecoveryError::Corrupted)));
+    }
+
+    #[test]
+    fn serde_wal_entry_put_truncated_sequence_no() {
+        let write_entry = WalEntry {
+            operation_type: OpType::Put,
+            key: String::from("key"),
+            value: Some(String::from("value")),
+            sequence_number: 1024,
+        };
+        let bytes = write_entry.to_bytes();
+        let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..bytes.len() - 2]);
+        assert!(matches!(read_entry, Err(RecoveryError::Corrupted)));
+    }
+
+    #[test]
+    fn serde_wal_entry_del_truncated_key_len() {
+        let write_entry = WalEntry {
+            operation_type: OpType::Delete,
+            key: String::from("key"),
+            value: None,
+            sequence_number: 1024,
+        };
+        let bytes = write_entry.to_bytes();
+        let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..HEADER_SIZE - 2]);
+        assert!(matches!(read_entry, Err(RecoveryError::Corrupted)));
+    }
+
+    #[test]
+    fn serde_wal_entry_del_truncated_key() {
+        let write_entry = WalEntry {
+            operation_type: OpType::Delete,
+            key: String::from("key"),
+            value: None,
+            sequence_number: 1024,
+        };
+        let bytes = write_entry.to_bytes();
+        let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..HEADER_SIZE + 1]);
+        assert!(matches!(read_entry, Err(RecoveryError::Corrupted)));
+    }
+
+    #[test]
+    fn serde_wal_entry_del_truncated_sequence_no() {
+        let write_entry = WalEntry {
+            operation_type: OpType::Delete,
+            key: String::from("key"),
+            value: None,
+            sequence_number: 1024,
+        };
+        let bytes = write_entry.to_bytes();
+        let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..bytes.len() - 4]);
+        assert!(matches!(read_entry, Err(RecoveryError::Corrupted)));
     }
 }
