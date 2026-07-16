@@ -35,6 +35,7 @@ pub enum RecoveryError {
     Corrupted,
 }
 
+#[derive(Debug, PartialEq)]
 pub struct WalEntry {
     pub operation_type: OpType,
     pub key: String,
@@ -130,24 +131,30 @@ impl Segment {
         entries: &mut Vec<WalEntry>,
     ) -> Result<Option<Vec<u8>>, RecoveryError> {
         let mut offset: usize = 0;
-        let mut record_len: usize = 0;
-        let mut u32_buf: [u8; 4] = [0, 0, 0, 0];
-        while offset + record_len < bytes.len() {
-            u32_buf.copy_from_slice(&bytes[offset..offset + 4]);
-            record_len = u32::from_le_bytes(u32_buf) as usize;
-            offset += 4;
-            if offset + record_len <= bytes.len() {
-                u32_buf.copy_from_slice(&bytes[offset..offset + 4]);
-                let read_checksum = u32::from_le_bytes(u32_buf);
-                offset += 4;
-                let calculated_checksum = calculate_checksum(&bytes[offset..offset + record_len]);
-                if read_checksum != calculated_checksum {
-                    return Err(RecoveryError::Corrupted);
-                }
-                let entry = WalEntry::from_bytes(&bytes[offset..offset + record_len])?;
-                entries.push(entry);
-                offset += record_len;
+        let mut record_len: usize;
+        let mut u32_buf: [u8; size_of::<u32>()] = [0, 0, 0, 0];
+        loop {
+            if size_of::<u32>() + offset > bytes.len() {
+                break;
             }
+            u32_buf.copy_from_slice(&bytes[offset..offset + size_of::<u32>()]);
+            record_len = u32::from_le_bytes(u32_buf) as usize;
+            offset += size_of::<u32>();
+            if offset + record_len > bytes.len() {
+                break;
+            }
+            u32_buf.copy_from_slice(&bytes[offset..offset + size_of::<u32>()]);
+            let read_checksum = u32::from_le_bytes(u32_buf);
+            offset += size_of::<u32>();
+            let calculated_checksum =
+                calculate_checksum(&bytes[offset..offset + record_len - size_of::<u32>()]);
+            if read_checksum != calculated_checksum {
+                return Err(RecoveryError::Corrupted);
+            }
+            let entry =
+                WalEntry::from_bytes(&bytes[offset..offset + record_len - size_of::<u32>()])?;
+            entries.push(entry);
+            offset += record_len - size_of::<u32>();
         }
         if offset == bytes.len() {
             Ok(None)
@@ -210,11 +217,6 @@ impl WalEntry {
         buf
     }
 
-    // Return Result?
-    // Op bytes could be out of range (>2)
-    // mismatching lengths
-    // invalid utf8
-    // Checksum mismatch
     fn from_bytes(bytes: &[u8]) -> Result<Self, RecoveryError> {
         if bytes.len() < 1 + size_of::<u32>() {
             return Err(RecoveryError::Corrupted);
@@ -277,7 +279,7 @@ impl From<FromUtf8Error> for RecoveryError {
 
 #[cfg(test)]
 mod tests {
-    use super::{HEADER_SIZE, OpType, RecoveryError, WalEntry};
+    use super::{HEADER_SIZE, OpType, RecoveryError, Segment, WalEntry};
     #[test]
     fn serde_wal_entry_delete_ok() {
         let write_entry = WalEntry {
@@ -448,5 +450,35 @@ mod tests {
         let bytes = write_entry.to_bytes();
         let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..bytes.len() - 4]);
         assert!(matches!(read_entry, Err(RecoveryError::Corrupted)));
+    }
+
+    #[test]
+    fn serde_multiple_wal_entries() {
+        let mut wal_entries_write = Vec::<WalEntry>::new();
+        for n in 0..1000 {
+            if n % 7 == 0 {
+                wal_entries_write.push(WalEntry {
+                    operation_type: OpType::Put,
+                    key: String::from("key") + &n.to_string(),
+                    value: Some(String::from("value") + &n.to_string()),
+                    sequence_number: n as u64,
+                });
+            } else {
+                wal_entries_write.push(WalEntry {
+                    operation_type: OpType::Delete,
+                    key: String::from("key") + &n.to_string(),
+                    value: None,
+                    sequence_number: n as u64,
+                });
+            }
+        }
+        let mut bytes = Vec::<u8>::new();
+        for entry in &wal_entries_write {
+            bytes.append(&mut entry.to_bytes());
+        }
+        let mut wal_entries_read = Vec::<WalEntry>::new();
+        let res = Segment::parse_validate_wal_entries(&bytes, &mut wal_entries_read);
+        assert!(matches!(res, Ok(None)));
+        assert_eq!(wal_entries_read, wal_entries_write);
     }
 }
