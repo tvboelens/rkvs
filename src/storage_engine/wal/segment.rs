@@ -139,6 +139,9 @@ impl Segment {
             }
             u32_buf.copy_from_slice(&bytes[offset..offset + size_of::<u32>()]);
             record_len = u32::from_le_bytes(u32_buf) as usize;
+            if record_len < HEADER_SIZE - size_of::<u32>() {
+                return Err(RecoveryError::Corrupted);
+            }
             offset += size_of::<u32>();
             if offset + record_len > bytes.len() {
                 break;
@@ -480,5 +483,116 @@ mod tests {
         let res = Segment::parse_validate_wal_entries(&bytes, &mut wal_entries_read);
         assert!(matches!(res, Ok(None)));
         assert_eq!(wal_entries_read, wal_entries_write);
+    }
+
+    #[test]
+    fn serde_multiple_wal_entries_checksum_mismatch() {
+        let mut wal_entries_write = Vec::<WalEntry>::new();
+        for n in 0..1000 {
+            if n % 7 == 0 {
+                wal_entries_write.push(WalEntry {
+                    operation_type: OpType::Put,
+                    key: String::from("key") + &n.to_string(),
+                    value: Some(String::from("value") + &n.to_string()),
+                    sequence_number: n as u64,
+                });
+            } else {
+                wal_entries_write.push(WalEntry {
+                    operation_type: OpType::Delete,
+                    key: String::from("key") + &n.to_string(),
+                    value: None,
+                    sequence_number: n as u64,
+                });
+            }
+        }
+        let mut bytes = Vec::<u8>::new();
+        for entry in &wal_entries_write {
+            if entry.sequence_number == 500 {
+                let mut corrupted_bytes = entry.to_bytes();
+                corrupted_bytes[7] += 1;
+                bytes.append(&mut corrupted_bytes);
+            } else {
+                bytes.append(&mut entry.to_bytes());
+            }
+        }
+        let mut wal_entries_read = Vec::<WalEntry>::new();
+        let res = Segment::parse_validate_wal_entries(&bytes, &mut wal_entries_read);
+        assert!(matches!(res, Err(RecoveryError::Corrupted)));
+        assert_eq!(wal_entries_read.len(), 500);
+        assert_eq!(wal_entries_read, wal_entries_write[0..500]);
+    }
+
+    #[test]
+    fn serde_multiple_wal_entries_truncated_entry() {
+        let mut wal_entries_write = Vec::<WalEntry>::new();
+        for n in 0..1000 {
+            if n % 7 == 0 {
+                wal_entries_write.push(WalEntry {
+                    operation_type: OpType::Put,
+                    key: String::from("key") + &n.to_string(),
+                    value: Some(String::from("value") + &n.to_string()),
+                    sequence_number: n as u64,
+                });
+            } else {
+                wal_entries_write.push(WalEntry {
+                    operation_type: OpType::Delete,
+                    key: String::from("key") + &n.to_string(),
+                    value: None,
+                    sequence_number: n as u64,
+                });
+            }
+        }
+        let mut bytes = Vec::<u8>::new();
+        for entry in &wal_entries_write {
+            if entry.sequence_number == 500 {
+                let corrupted_bytes = entry.to_bytes();
+                bytes.append(&mut corrupted_bytes[0..corrupted_bytes.len() - 5].to_vec());
+            } else {
+                bytes.append(&mut entry.to_bytes());
+            }
+        }
+        let mut wal_entries_read = Vec::<WalEntry>::new();
+        let res = Segment::parse_validate_wal_entries(&bytes, &mut wal_entries_read);
+        assert!(matches!(res, Err(RecoveryError::Corrupted)));
+        assert_eq!(wal_entries_read.len(), 500);
+        assert_eq!(wal_entries_read, wal_entries_write[0..500]);
+    }
+
+    #[test]
+    fn serde_multiple_wal_entries_zero_len_entry() {
+        let mut wal_entries_write = Vec::<WalEntry>::new();
+        for n in 0..10 {
+            if n % 7 == 0 {
+                wal_entries_write.push(WalEntry {
+                    operation_type: OpType::Put,
+                    key: String::from("key") + &n.to_string(),
+                    value: Some(String::from("value") + &n.to_string()),
+                    sequence_number: n as u64,
+                });
+            } else {
+                wal_entries_write.push(WalEntry {
+                    operation_type: OpType::Delete,
+                    key: String::from("key") + &n.to_string(),
+                    value: None,
+                    sequence_number: n as u64,
+                });
+            }
+        }
+        let mut bytes = Vec::<u8>::new();
+        for entry in &wal_entries_write {
+            if entry.sequence_number == 5 {
+                let len: u32 = 0;
+                let mut corrupted_bytes = entry.to_bytes();
+                corrupted_bytes[0..size_of::<u32>()].copy_from_slice(&len.to_le_bytes());
+                bytes.append(&mut corrupted_bytes);
+            } else {
+                bytes.append(&mut entry.to_bytes());
+            }
+        }
+        let mut wal_entries_read = Vec::<WalEntry>::new();
+        let res = Segment::parse_validate_wal_entries(&bytes, &mut wal_entries_read);
+        assert!(matches!(res, Err(RecoveryError::Corrupted)));
+        assert_eq!(wal_entries_read.len(), 5);
+        assert_eq!(wal_entries_read, wal_entries_write[0..5]);
     }
 }
