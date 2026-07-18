@@ -54,15 +54,23 @@ pub fn determine_segment_filename(
     sequence_number: &u64,
     segment_size: &u32,
 ) -> String {
-    let str1 = format!("{:x}", timeline);
+    // The hex strings should have length 8 or 16, therefore we might need to pad them with leading zeros
+    let mut padding_bytes = Vec::<u8>::new();
+    let mut timeline_hex_str = format!("{:x}", timeline);
+    padding_bytes.resize(8 - timeline_hex_str.len(), 48); // "0" = 0x30 = 48
+    timeline_hex_str.insert_str(0, &String::from_utf8(padding_bytes.clone()).unwrap());
     // logical log is 4GB = 2^32 bytes, hence the number of the logical
     // log containing this sequence number is the first 8 bytes (32 bits)
-    let str2 = &format!("{:x}", sequence_number)[0..8];
+    let mut sequence_number_hex_str = format!("{:x}", sequence_number);
+    padding_bytes.resize(16 - sequence_number_hex_str.len(), 48);
+    sequence_number_hex_str.insert_str(0, &String::from_utf8(padding_bytes.clone()).unwrap());
     let base: u64 = 2;
     let no_of_segments: u64 = base.pow(32) / *segment_size as u64;
     let segment_no = sequence_number / no_of_segments;
-    let str3 = &format!("{:x}", segment_no)[8..];
-    str1 + str2 + str3 + ".wal"
+    let mut segment_size_hex_str = format!("{:x}", segment_no);
+    padding_bytes.resize(8 - segment_size_hex_str.len(), 48);
+    segment_size_hex_str.insert_str(0, &String::from_utf8(padding_bytes).unwrap());
+    timeline_hex_str + &sequence_number_hex_str[0..8] + &segment_size_hex_str[8..] + ".wal"
 }
 
 pub fn final_entry_after(filename: &str, file_size: u64, sequence_number: &u64) -> bool {
@@ -74,6 +82,7 @@ pub fn final_entry_after(filename: &str, file_size: u64, sequence_number: &u64) 
 impl Segment {
     pub fn append(&mut self, buf: &[u8]) -> std::io::Result<()> {
         let buf_size = buf.len() as u32;
+        assert!(self.file_size + buf_size <= self.max_size);
         self.file.write_all(buf).map(|_| self.file_size += buf_size)
     }
 
@@ -288,7 +297,21 @@ impl From<FromUtf8Error> for RecoveryError {
 
 #[cfg(test)]
 mod tests {
-    use super::{HEADER_SIZE, OpType, RecoveryError, Segment, WalEntry};
+    use std::fs::{self, DirBuilder, File};
+    use std::io;
+    use std::path::PathBuf;
+
+    use super::{
+        HEADER_SIZE, OpType, RecoveryError, Segment, WalEntry, determine_segment_filename,
+    };
+
+    fn setup(path: &PathBuf) -> io::Result<()> {
+        let _ = fs::remove_dir_all(path);
+        DirBuilder::new().create(path)
+    }
+    fn teardown(path: &PathBuf) {
+        let _ = fs::remove_dir_all(path);
+    }
     #[test]
     fn serde_wal_entry_delete_ok() {
         let write_entry = WalEntry {
@@ -601,4 +624,38 @@ mod tests {
         assert_eq!(wal_entries_read.len(), 5);
         assert_eq!(wal_entries_read, wal_entries_write[0..5]);
     }
+
+    #[test]
+    fn segment_append_ok() {
+        let dir = PathBuf::from("./Segment_Append_Ok");
+        let segment_size = 256;
+        assert!(setup(&dir).is_ok());
+        let filename = determine_segment_filename(&0, &0, &segment_size);
+        let fp = dir.join(filename);
+        let file = File::create(fp).unwrap();
+        let mut segment = Segment::new(file, segment_size);
+        segment.append(vec![0, 1, 2, 3].as_slice()).unwrap();
+        assert_eq!(segment.file_size, 4);
+        teardown(&dir);
+    }
 }
+
+/*
+1. determine_segment_filename
+2. final_entry_after
+3. Segment
+    1. append
+        1. Check if size ok
+        2. Empty buf
+        3. One entry
+        4. Exceeding max_size should be impossible -> panic or error
+    2. pad
+        1. Resulting file size is exactly max_size
+    3. Internal file_size equals file size according to OS
+    3. read_parse_validate both versions
+    4. parse_validate_wal_entries -> done
+4. WalEntry
+    1. to_bytes -> done
+    2. from_bytes -> done
+
+*/
