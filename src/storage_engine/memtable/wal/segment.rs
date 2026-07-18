@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, Write};
 use std::string::FromUtf8Error;
@@ -51,17 +50,25 @@ pub fn calculate_checksum(buf: &[u8]) -> u32 {
 }
 
 pub fn determine_segment_filename(
-    timeline: u32,
-    sequence_number: u64,
-    segment_size: u64,
+    timeline: &u32,
+    sequence_number: &u64,
+    segment_size: &u32,
 ) -> String {
     let str1 = format!("{:x}", timeline);
+    // logical log is 4GB = 2^32 bytes, hence the number of the logical
+    // log containing this sequence number is the first 8 bytes (32 bits)
     let str2 = &format!("{:x}", sequence_number)[0..8];
     let base: u64 = 2;
-    let no_of_segments: u64 = base.pow(32) / segment_size;
+    let no_of_segments: u64 = base.pow(32) / *segment_size as u64;
     let segment_no = sequence_number / no_of_segments;
     let str3 = &format!("{:x}", segment_no)[8..];
     str1 + str2 + str3 + ".wal"
+}
+
+pub fn final_entry_after(filename: &str, file_size: u64, sequence_number: &u64) -> bool {
+    let base_2: u64 = 2;
+    let base_offset = u64::from_str_radix(&filename[8..16], 16).unwrap() * base_2.pow(32);
+    *sequence_number <= base_offset + file_size
 }
 
 impl Segment {
@@ -73,13 +80,22 @@ impl Segment {
     pub fn pad(&mut self) -> std::io::Result<()> {
         let buf_size = self.max_size - self.file_size;
         let mut buf = Vec::new();
-        buf.resize(buf_size.try_into().unwrap(), 0);
+        buf.resize(buf_size as usize, 0);
         self.append(buf.as_slice())
     }
 
     pub fn new(file: File, max_size: u32) -> Self {
         let metadata = file.metadata().unwrap();
         let file_size = metadata.len() as u32;
+        Segment {
+            file: file,
+            file_size: file_size,
+            max_size: max_size,
+        }
+    }
+
+    pub fn from(mut file: File, file_size: u32, max_size: u32) -> Self {
+        file.seek(io::SeekFrom::End(0)).unwrap();
         Segment {
             file: file,
             file_size: file_size,
@@ -95,33 +111,23 @@ impl Segment {
         self.max_size - self.file_size
     }
 
-    pub fn recover(
-        &mut self,
-        table: &mut HashMap<String, Option<String>>,
-        offset: u32,
-    ) -> Result<Option<Vec<u8>>, RecoveryError> {
-        let mut wal_entries = Vec::<WalEntry>::new();
-        let res = self.read_parse_validate(&mut wal_entries, offset);
-        for entry in wal_entries {
-            match entry.operation_type {
-                OpType::Put => {
-                    table.insert(entry.key, entry.value);
-                }
-                OpType::Delete => {
-                    table.insert(entry.key, None);
-                }
-            }
-        }
-        res
-    }
-
-    fn read_parse_validate(
+    pub fn read_parse_validate_from_offset(
         &mut self,
         entries: &mut Vec<WalEntry>,
         offset: u32,
     ) -> Result<Option<Vec<u8>>, RecoveryError> {
         let mut bytes = Vec::<u8>::new();
         self.file.seek(io::SeekFrom::Start(offset as u64))?;
+        self.file.read_to_end(&mut bytes)?;
+        Segment::parse_validate_wal_entries(&bytes, entries)
+    }
+
+    pub fn read_parse_validate_from_partial_record(
+        &mut self,
+        mut bytes: Vec<u8>,
+        entries: &mut Vec<WalEntry>,
+    ) -> Result<Option<Vec<u8>>, RecoveryError> {
+        self.file.seek(io::SeekFrom::Start(0))?;
         self.file.read_to_end(&mut bytes)?;
         Segment::parse_validate_wal_entries(&bytes, entries)
     }

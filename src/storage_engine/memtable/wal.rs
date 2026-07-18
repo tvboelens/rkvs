@@ -1,13 +1,8 @@
-pub mod segment;
-
 use ::std::io;
 use segment::{Segment, WalEntry, determine_segment_filename};
 use std::path::PathBuf;
 
-enum SerError {
-    InvalidKey,
-    InvalidValue,
-}
+pub mod segment;
 
 /*
 methods:
@@ -40,7 +35,7 @@ impl Wal {
                 2. Then go to next lsn (possibly in next segment)
                 3. Then call recover()
          */
-        let filename = PathBuf::from(determine_segment_filename(0, 0, segment_max_size as u64));
+        let filename = PathBuf::from(determine_segment_filename(&0, &0, &segment_max_size));
         let path = dir.join(filename);
         let file = std::fs::File::create(path)?;
         let segment = Segment::new(file, segment_max_size);
@@ -76,7 +71,7 @@ impl Wal {
             self.active_segment.append(&buf[segment::HEADER_SIZE..])?;
         } else {
             self.active_segment.pad()?;
-            self.rotate(entry.sequence_number + buf_size as u64);
+            self.rotate(entry.sequence_number + buf_size as u64)?;
             self.active_segment.append(buf.as_slice())?;
         }
         self.last_sequence_number = entry.sequence_number;
@@ -90,13 +85,24 @@ impl Wal {
     }
 
     fn rotate(&mut self, next_sequence_number: u64) -> io::Result<()> {
-        let segment_size = self.segment_max_size as u64;
-        let filename = determine_segment_filename(0, next_sequence_number, segment_size);
+        let filename =
+            determine_segment_filename(&0, &next_sequence_number, &self.segment_max_size);
         let path = self.dir.join(filename);
         let file = std::fs::File::create(path)?;
         self.active_segment = Segment::new(file, self.segment_max_size);
         Ok(())
     }
+
+    /*
+    1. Check if SSTable files exist (separate function)
+        1. Yes -> get largest LSN
+        2. No -> largest LSN = 0
+    2. Check if WAL files exist
+        1. No -> new memtable, no recovery
+        2. Yes -> check if segments exist containing newer LSNs
+            1. No -> new memtable, no recovery
+            2. Yes -> recover
+     */
 }
 /*
 LSN:

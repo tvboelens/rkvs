@@ -1,12 +1,11 @@
 use std::io;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::mpsc::{RecvTimeoutError, SendError};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot::{Sender, channel};
 
-pub mod memtable;
-pub mod wal;
-
+mod memtable;
 pub trait Store {
     fn get(
         &self,
@@ -42,13 +41,14 @@ pub struct StorageEngine {
 
 struct Worker {
     memtable: memtable::MemTable,
-    wal: wal::Wal,
     receiver: mpsc::Receiver<Job>,
     timeout: Duration,
 }
 
 pub struct StorageEngineConf {
     timeout: Duration,
+    dir: PathBuf,
+    segment_size: u32,
 }
 
 #[derive(Debug)]
@@ -103,23 +103,21 @@ impl Store for StorageEngine {
 }
 
 impl StorageEngine {
-    pub fn new(config: StorageEngineConf) -> Self {
-        let memtable = memtable::MemTable::new();
-        let wal = wal::Wal::from(0);
+    pub fn new(config: StorageEngineConf) -> io::Result<Self> {
+        let memtable = memtable::MemTable::start(config.dir, config.segment_size, 0)?;
         let (tx, rx) = mpsc::channel();
 
         let mut worker = Worker {
             memtable: memtable,
-            wal: wal,
             receiver: rx,
             timeout: config.timeout,
         };
         let handle = std::thread::spawn(move || worker.run());
-        StorageEngine {
+        Ok(StorageEngine {
             //memtable: memtable_ptr.clone(),
             sender: tx,
             join_handle: handle,
-        }
+        })
     }
 
     pub fn shutdown(self) {
@@ -137,20 +135,20 @@ impl Worker {
                 Err(error) => match error {
                     RecvTimeoutError::Disconnected => break,
                     RecvTimeoutError::Timeout => {
-                        self.wal.sync().unwrap();
+                        self.memtable.sync().unwrap();
                         last_sync = Instant::now();
                         elapsed = self.timeout;
                     }
                 },
                 Ok(job) => {
                     let res = match job.command {
-                        Command::Delete(key) => self.do_delete(&key),
-                        Command::Get(key) => Ok(self.do_get(&key)),
-                        Command::Put(key, value) => self.do_put(key, value),
+                        Command::Delete(key) => self.memtable.delete(&key),
+                        Command::Get(key) => Ok(self.memtable.get(&key)),
+                        Command::Put(key, value) => self.memtable.put(key, value),
                     };
                     elapsed -= Instant::now() - last_sync;
                     if elapsed.is_zero() {
-                        self.wal.sync().unwrap();
+                        self.memtable.sync().unwrap();
                         last_sync = Instant::now();
                         elapsed = self.timeout;
                     }
@@ -158,32 +156,6 @@ impl Worker {
                 }
             }
         }
-    }
-
-    fn do_delete(&mut self, key: &String) -> Result<Option<String>, std::io::Error> {
-        let entry = wal::WalEntry {
-            operation_type: wal::OpType::Delete,
-            key: key.clone(),
-            value: None,
-            sequence_number: self.wal.last_sequence_number() + 1,
-        };
-        self.wal.append(&entry)?;
-        Ok(self.memtable.delete(key))
-    }
-
-    fn do_put(&mut self, key: String, value: String) -> Result<Option<String>, std::io::Error> {
-        let entry = wal::WalEntry {
-            operation_type: wal::OpType::Put,
-            key: key.clone(),
-            value: Some(value.clone()),
-            sequence_number: self.wal.last_sequence_number() + 1,
-        };
-        self.wal.append(&entry)?;
-        Ok(self.memtable.put(key, value))
-    }
-
-    fn do_get(&self, key: &String) -> Option<String> {
-        self.memtable.get(key)
     }
 }
 
