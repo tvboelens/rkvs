@@ -161,10 +161,10 @@ impl Segment {
             if record_len < HEADER_SIZE - size_of::<u32>() {
                 return Err(RecoveryError::Corrupted);
             }
-            offset += size_of::<u32>();
-            if offset + record_len > bytes.len() {
+            if offset + size_of::<u32>() + record_len > bytes.len() {
                 break;
             }
+            offset += size_of::<u32>();
             u32_buf.copy_from_slice(&bytes[offset..offset + size_of::<u32>()]);
             let read_checksum = u32::from_le_bytes(u32_buf);
             offset += size_of::<u32>();
@@ -603,6 +603,95 @@ mod tests {
     }
 
     #[test]
+    fn serde_multiple_wal_entries_truncated_entry_end_no_pad() {
+        let mut wal_entries_write = Vec::<WalEntry>::new();
+        for n in 0..1000 {
+            if n % 7 == 0 {
+                wal_entries_write.push(WalEntry {
+                    operation_type: OpType::Put,
+                    key: String::from("key") + &n.to_string(),
+                    value: Some(String::from("value") + &n.to_string()),
+                    sequence_number: n as u64,
+                });
+            } else {
+                wal_entries_write.push(WalEntry {
+                    operation_type: OpType::Delete,
+                    key: String::from("key") + &n.to_string(),
+                    value: None,
+                    sequence_number: n as u64,
+                });
+            }
+        }
+        let mut bytes = Vec::<u8>::new();
+        for entry in &wal_entries_write {
+            if entry.sequence_number == wal_entries_write.len() as u64 - 1 {
+                let mut truncated_bytes = entry.to_bytes()[0..HEADER_SIZE].to_vec();
+                bytes.append(&mut truncated_bytes);
+            } else {
+                bytes.append(&mut entry.to_bytes());
+            }
+        }
+        let mut wal_entries_read = Vec::<WalEntry>::new();
+        let res = Segment::parse_validate_wal_entries(&bytes, &mut wal_entries_read);
+        assert_eq!(wal_entries_read.len(), wal_entries_write.len() - 1);
+        assert_eq!(
+            wal_entries_read,
+            wal_entries_write[0..wal_entries_write.len() - 1]
+        );
+        assert!(matches!(res, Ok(Some(_))));
+        let bytes = res.unwrap().unwrap();
+        assert_eq!(
+            bytes,
+            wal_entries_write[wal_entries_write.len() - 1].to_bytes()[0..HEADER_SIZE].to_vec()
+        );
+    }
+
+    #[test]
+    fn serde_multiple_wal_entries_truncated_entry_end_pad() {
+        let mut wal_entries_write = Vec::<WalEntry>::new();
+        for n in 0..1000 {
+            if n % 7 == 0 {
+                wal_entries_write.push(WalEntry {
+                    operation_type: OpType::Put,
+                    key: String::from("key") + &n.to_string(),
+                    value: Some(String::from("value") + &n.to_string()),
+                    sequence_number: n as u64,
+                });
+            } else {
+                wal_entries_write.push(WalEntry {
+                    operation_type: OpType::Delete,
+                    key: String::from("key") + &n.to_string(),
+                    value: None,
+                    sequence_number: n as u64,
+                });
+            }
+        }
+        let mut bytes = Vec::<u8>::new();
+        for entry in &wal_entries_write {
+            if entry.sequence_number == wal_entries_write.len() as u64 - 1 {
+                let mut truncated_bytes = entry.to_bytes()[0..HEADER_SIZE].to_vec();
+                truncated_bytes.resize(truncated_bytes.len() + 4, 0);
+                bytes.append(&mut truncated_bytes);
+            } else {
+                bytes.append(&mut entry.to_bytes());
+            }
+        }
+        let mut wal_entries_read = Vec::<WalEntry>::new();
+        let res = Segment::parse_validate_wal_entries(&bytes, &mut wal_entries_read);
+        assert_eq!(wal_entries_read.len(), wal_entries_write.len() - 1);
+        assert_eq!(
+            wal_entries_read,
+            wal_entries_write[0..wal_entries_write.len() - 1]
+        );
+        assert!(matches!(res, Ok(Some(_))));
+        let bytes = res.unwrap().unwrap();
+        let mut truncated_bytes_padded =
+            wal_entries_write[wal_entries_write.len() - 1].to_bytes()[0..HEADER_SIZE].to_vec();
+        truncated_bytes_padded.resize(truncated_bytes_padded.len() + 4, 0);
+        assert_eq!(bytes, truncated_bytes_padded);
+    }
+
+    #[test]
     fn serde_multiple_wal_entries_zero_len_entry() {
         let mut wal_entries_write = Vec::<WalEntry>::new();
         for n in 0..10 {
@@ -777,6 +866,136 @@ mod tests {
     }
 
     #[test]
+    fn segment_read_parse_validate_from_offset_truncated_no_pad() {
+        let entries = vec![
+            WalEntry {
+                key: String::from("key1"),
+                operation_type: OpType::Put,
+                sequence_number: 0,
+                value: Some(String::from("value1")),
+            },
+            WalEntry {
+                key: String::from("key2"),
+                operation_type: OpType::Delete,
+                sequence_number: 35, // bytes len of previous entry = 35
+                value: None,
+            },
+            WalEntry {
+                key: String::from("key3"),
+                operation_type: OpType::Put,
+                sequence_number: 60, // bytes len of previous entry = 25
+                value: Some(String::from("value2")),
+            },
+            WalEntry {
+                key: String::from("key3"),
+                operation_type: OpType::Put,
+                sequence_number: 95, // bytes len of previous entry = 35
+                value: Some(String::from("value3")),
+            },
+        ];
+        let dir = PathBuf::from("./segment_read_parse_validate_from_offset_truncated_no_pad");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 4096;
+        assert!(cl.setup().is_ok());
+        let filename = determine_segment_filename(&0, &0, &segment_size);
+        let fp = dir.join(filename);
+        let file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create(true)
+            .open(fp)
+            .unwrap();
+        let mut segment = Segment::new(file, segment_size);
+        for entry in &entries {
+            segment.append(&entry.to_bytes()).unwrap()
+        }
+        let truncated_entry = WalEntry {
+            key: String::from("key4"),
+            operation_type: OpType::Delete,
+            sequence_number: 130, // bytes len of previous entry = 35
+            value: None,
+        };
+        let buf = truncated_entry.to_bytes()[0..HEADER_SIZE].to_vec();
+        segment.append(&buf).unwrap();
+        assert_eq!(segment.file_size, 143);
+        let mut entries_read = Vec::<WalEntry>::new();
+        let res = segment
+            .read_parse_validate_from_offset(&mut entries_read, 35)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entries[1..], entries_read);
+        assert_eq!(res, buf);
+    }
+
+    #[test]
+    fn segment_read_parse_validate_from_offset_truncated_pad() {
+        let entries = vec![
+            WalEntry {
+                key: String::from("key1"),
+                operation_type: OpType::Put,
+                sequence_number: 0,
+                value: Some(String::from("value1")),
+            },
+            WalEntry {
+                key: String::from("key2"),
+                operation_type: OpType::Delete,
+                sequence_number: 35, // bytes len of previous entry = 35
+                value: None,
+            },
+            WalEntry {
+                key: String::from("key3"),
+                operation_type: OpType::Put,
+                sequence_number: 60, // bytes len of previous entry = 25
+                value: Some(String::from("value2")),
+            },
+            WalEntry {
+                key: String::from("key3"),
+                operation_type: OpType::Put,
+                sequence_number: 95, // bytes len of previous entry = 35
+                value: Some(String::from("value3")),
+            },
+        ];
+        let dir = PathBuf::from("./segment_read_parse_validate_from_offset_truncated_pad");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 150;
+        assert!(cl.setup().is_ok());
+        let filename = determine_segment_filename(&0, &0, &segment_size);
+        let fp = dir.join(filename);
+        let file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create(true)
+            .open(fp)
+            .unwrap();
+        let mut segment = Segment::new(file, segment_size);
+        for entry in &entries {
+            segment.append(&entry.to_bytes()).unwrap()
+        }
+        let truncated_entry = WalEntry {
+            key: String::from("key4"),
+            operation_type: OpType::Delete,
+            sequence_number: 130, // bytes len of previous entry = 35
+            value: None,
+        };
+        let mut buf = truncated_entry.to_bytes()[0..HEADER_SIZE].to_vec();
+        segment.append(&buf).unwrap();
+        buf.resize(
+            buf.len() + (segment.max_size - segment.file_size) as usize,
+            0,
+        );
+        segment.pad().unwrap();
+
+        assert_eq!(segment.file_size, segment_size);
+        let mut entries_read = Vec::<WalEntry>::new();
+        let res = segment
+            .read_parse_validate_from_offset(&mut entries_read, 35)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entries[1..], entries_read);
+        assert_eq!(res, buf);
+    }
+
+    #[test]
     fn segment_read_parse_validate_from_partial_record() {
         let entries = vec![
             WalEntry {
@@ -832,6 +1051,146 @@ mod tests {
             .unwrap();
         assert!(matches!(res, None));
         assert_eq!(entries, entries_read);
+    }
+
+    #[test]
+    fn segment_read_parse_validate_from_partial_record_truncated_pad() {
+        let entries = vec![
+            WalEntry {
+                key: String::from("key1"),
+                operation_type: OpType::Put,
+                sequence_number: 0,
+                value: Some(String::from("value1")),
+            },
+            WalEntry {
+                key: String::from("key2"),
+                operation_type: OpType::Delete,
+                sequence_number: 35, // bytes len of previous entry = 35
+                value: None,
+            },
+            WalEntry {
+                key: String::from("key3"),
+                operation_type: OpType::Put,
+                sequence_number: 60, // bytes len of previous entry = 25
+                value: Some(String::from("value2")),
+            },
+            WalEntry {
+                key: String::from("key3"),
+                operation_type: OpType::Put,
+                sequence_number: 95, // bytes len of previous entry = 35
+                value: Some(String::from("value3")),
+            },
+        ];
+        let dir = PathBuf::from("./segment_read_parse_validate_from_partial_record_truncated_pad");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 135;
+        assert!(cl.setup().is_ok());
+        let filename = determine_segment_filename(&0, &0, &segment_size);
+        let fp = dir.join(filename);
+        let file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create(true)
+            .open(fp)
+            .unwrap();
+        let mut segment = Segment::new(file, segment_size);
+        let mut header = Vec::<u8>::new();
+        header.append(&mut entries[0].to_bytes()[0..HEADER_SIZE].to_vec());
+        let mut payload = Vec::<u8>::new();
+        payload.append(&mut entries[0].to_bytes()[HEADER_SIZE..].to_vec());
+        segment.append(&payload).unwrap();
+        for entry in &entries[1..] {
+            segment.append(&entry.to_bytes()).unwrap()
+        }
+        let truncated_entry = WalEntry {
+            key: String::from("key4"),
+            operation_type: OpType::Delete,
+            sequence_number: 130, // bytes len of previous entry = 35
+            value: None,
+        };
+        let mut buf = truncated_entry.to_bytes()[0..HEADER_SIZE].to_vec();
+        segment.append(&buf).unwrap();
+        buf.resize(
+            buf.len() + (segment.max_size - segment.file_size) as usize,
+            0,
+        );
+        segment.pad().unwrap();
+        assert_eq!(segment.file_size, segment_size);
+        let mut entries_read = Vec::<WalEntry>::new();
+        let res = segment
+            .read_parse_validate_from_partial_record(header, &mut entries_read)
+            .unwrap();
+        assert!(matches!(res, Some(_)));
+        assert_eq!(entries, entries_read);
+        assert_eq!(res.unwrap(), buf)
+    }
+
+    #[test]
+    fn segment_read_parse_validate_from_partial_record_truncated_no_pad() {
+        let entries = vec![
+            WalEntry {
+                key: String::from("key1"),
+                operation_type: OpType::Put,
+                sequence_number: 0,
+                value: Some(String::from("value1")),
+            },
+            WalEntry {
+                key: String::from("key2"),
+                operation_type: OpType::Delete,
+                sequence_number: 35, // bytes len of previous entry = 35
+                value: None,
+            },
+            WalEntry {
+                key: String::from("key3"),
+                operation_type: OpType::Put,
+                sequence_number: 60, // bytes len of previous entry = 25
+                value: Some(String::from("value2")),
+            },
+            WalEntry {
+                key: String::from("key3"),
+                operation_type: OpType::Put,
+                sequence_number: 95, // bytes len of previous entry = 35
+                value: Some(String::from("value3")),
+            },
+        ];
+        let dir =
+            PathBuf::from("./segment_read_parse_validate_from_partial_record_truncated_no_pad");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 4096;
+        assert!(cl.setup().is_ok());
+        let filename = determine_segment_filename(&0, &0, &segment_size);
+        let fp = dir.join(filename);
+        let file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create(true)
+            .open(fp)
+            .unwrap();
+        let mut segment = Segment::new(file, segment_size);
+        let mut header = Vec::<u8>::new();
+        header.append(&mut entries[0].to_bytes()[0..HEADER_SIZE].to_vec());
+        let mut payload = Vec::<u8>::new();
+        payload.append(&mut entries[0].to_bytes()[HEADER_SIZE..].to_vec());
+        segment.append(&payload).unwrap();
+        for entry in &entries[1..] {
+            segment.append(&entry.to_bytes()).unwrap()
+        }
+        let truncated_entry = WalEntry {
+            key: String::from("key4"),
+            operation_type: OpType::Delete,
+            sequence_number: 130, // bytes len of previous entry = 35
+            value: None,
+        };
+        let mut buf = truncated_entry.to_bytes()[0..HEADER_SIZE].to_vec();
+        segment.append(&buf).unwrap();
+        assert_eq!(segment.file_size, 130);
+        let mut entries_read = Vec::<WalEntry>::new();
+        let res = segment
+            .read_parse_validate_from_partial_record(header, &mut entries_read)
+            .unwrap();
+        assert!(matches!(res, Some(_)));
+        assert_eq!(entries, entries_read);
+        assert_eq!(res.unwrap(), buf);
     }
 
     struct FilenameTest {
@@ -927,7 +1286,3 @@ mod tests {
         }
     }
 }
-/*  TODO: read_parse_validate both versions (from offset and partial entry)
-    1. Normal -> done
-    2. truncated records at end
-*/
