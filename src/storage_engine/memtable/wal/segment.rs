@@ -49,6 +49,10 @@ pub fn calculate_checksum(buf: &[u8]) -> u32 {
     digest.finalize()
 }
 
+// timeline, logical_log_number, segment_number + ".wal"
+// all hex strings of len 8 (u32)
+// logical_log_number is first 4 bytes (u32) of segment_number
+// segment number is last 4 bytes of segment_number (as u32) divided by segment_size
 pub fn determine_segment_filename(
     timeline: &u32,
     sequence_number: &u64,
@@ -64,19 +68,19 @@ pub fn determine_segment_filename(
     let mut sequence_number_hex_str = format!("{:x}", sequence_number);
     padding_bytes.resize(16 - sequence_number_hex_str.len(), 48);
     sequence_number_hex_str.insert_str(0, &String::from_utf8(padding_bytes.clone()).unwrap());
-    let base: u64 = 2;
-    let no_of_segments: u64 = base.pow(32) / *segment_size as u64;
-    let segment_no = sequence_number / no_of_segments;
+    let two: u64 = 2;
+    let segment_no = sequence_number % two.pow(32) / *segment_size as u64;
     let mut segment_size_hex_str = format!("{:x}", segment_no);
-    padding_bytes.resize(8 - segment_size_hex_str.len(), 48);
+    padding_bytes.resize(16 - segment_size_hex_str.len(), 48);
     segment_size_hex_str.insert_str(0, &String::from_utf8(padding_bytes).unwrap());
     timeline_hex_str + &sequence_number_hex_str[0..8] + &segment_size_hex_str[8..] + ".wal"
 }
 
 pub fn final_entry_after(filename: &str, file_size: u64, sequence_number: &u64) -> bool {
     let base_2: u64 = 2;
+    let segment_no = u64::from_str_radix(&filename[16..24], 16).unwrap();
     let base_offset = u64::from_str_radix(&filename[8..16], 16).unwrap() * base_2.pow(32);
-    *sequence_number <= base_offset + file_size
+    *sequence_number <= base_offset + file_size * segment_no
 }
 
 impl Segment {
@@ -303,15 +307,26 @@ mod tests {
 
     use super::{
         HEADER_SIZE, OpType, RecoveryError, Segment, WalEntry, determine_segment_filename,
+        final_entry_after,
     };
 
-    fn setup(path: &PathBuf) -> io::Result<()> {
-        let _ = fs::remove_dir_all(path);
-        DirBuilder::new().create(path)
+    struct Cleanup {
+        dir: PathBuf,
     }
-    fn teardown(path: &PathBuf) {
-        let _ = fs::remove_dir_all(path);
+
+    impl Cleanup {
+        fn setup(&self) -> io::Result<()> {
+            let _ = fs::remove_dir_all(&self.dir);
+            DirBuilder::new().create(&self.dir)
+        }
     }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
     #[test]
     fn serde_wal_entry_delete_ok() {
         let write_entry = WalEntry {
@@ -628,34 +643,177 @@ mod tests {
     #[test]
     fn segment_append_ok() {
         let dir = PathBuf::from("./Segment_Append_Ok");
+        let cl = Cleanup { dir: dir.clone() };
         let segment_size = 256;
-        assert!(setup(&dir).is_ok());
+        assert!(cl.setup().is_ok());
         let filename = determine_segment_filename(&0, &0, &segment_size);
         let fp = dir.join(filename);
         let file = File::create(fp).unwrap();
         let mut segment = Segment::new(file, segment_size);
         segment.append(vec![0, 1, 2, 3].as_slice()).unwrap();
         assert_eq!(segment.file_size, 4);
-        teardown(&dir);
+    }
+
+    #[test]
+    fn segment_append_empty() {
+        let dir = PathBuf::from("./Segment_Append_Empty");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 256;
+        assert!(cl.setup().is_ok());
+        let filename = determine_segment_filename(&0, &0, &segment_size);
+        let fp = dir.join(filename);
+        let file = File::create(fp).unwrap();
+        let mut segment = Segment::new(file, segment_size);
+        let buf = Vec::new();
+        segment.append(&buf).unwrap();
+        assert_eq!(segment.file_size, 0);
+    }
+
+    #[test]
+    fn segment_append_one_entry() {
+        let dir = PathBuf::from("./Segment_Append_One_Entry");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 256;
+        assert!(cl.setup().is_ok());
+        let filename = determine_segment_filename(&0, &0, &segment_size);
+        let fp = dir.join(filename);
+        let file = File::create(fp).unwrap();
+        let mut segment = Segment::new(file, segment_size);
+        let bytes = WalEntry {
+            operation_type: OpType::Put,
+            key: String::from("key"),
+            sequence_number: 1024,
+            value: Some(String::from("value")),
+        }
+        .to_bytes();
+        segment.append(&bytes).unwrap();
+        assert_eq!(segment.file_size as usize, bytes.len());
+    }
+
+    #[test]
+    #[should_panic]
+    fn segment_append_too_large() {
+        let dir = PathBuf::from("./Segment_Append_Too_Large");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 2;
+        assert!(cl.setup().is_ok());
+        let filename = determine_segment_filename(&0, &0, &segment_size);
+        let fp = dir.join(filename);
+        let file = File::create(fp).unwrap();
+        let mut segment = Segment::new(file, segment_size);
+        let _ = segment.append(vec![0, 1, 2, 3].as_slice());
+    }
+
+    #[test]
+    fn segment_pad() {
+        let dir = PathBuf::from("./Segment_Pad");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 256;
+        assert!(cl.setup().is_ok());
+        let filename = determine_segment_filename(&0, &0, &segment_size);
+        let fp = dir.join(filename);
+        let file = File::create(fp).unwrap();
+        let segment_file = file.try_clone().unwrap();
+        let mut segment = Segment::new(file, segment_size);
+        segment.append(vec![0, 1, 2, 3].as_slice()).unwrap();
+        assert_eq!(segment.file_size, 4);
+        segment.pad().unwrap();
+        let metadata = segment_file.metadata().unwrap();
+        assert_eq!(segment.file_size, segment_size);
+        assert_eq!(metadata.len(), segment_size as u64);
+    }
+
+    struct FilenameTest {
+        pub timeline: u32,
+        pub sequence_number: u64,
+        pub segment_size: u32,
+        pub expected: String,
+    }
+
+    #[test]
+    fn segment_filename() {
+        let base_two: u32 = 2;
+        let base_two_u64: u64 = 2;
+        let tests = vec![
+            FilenameTest {
+                timeline: 0,
+                sequence_number: 0,
+                segment_size: 2,
+                expected: String::from("000000000000000000000000.wal"),
+            },
+            FilenameTest {
+                timeline: 0,
+                sequence_number: base_two_u64.pow(16) + 30, // 0x000000000001001e
+                segment_size: base_two.pow(8),
+                expected: String::from("000000000000000000000100.wal"),
+            },
+            FilenameTest {
+                timeline: 0,
+                sequence_number: base_two_u64.pow(40) + 8443, // 0x00000100000020fb
+                segment_size: base_two.pow(16),
+                expected: String::from("000000000000010000000000.wal"),
+            },
+            FilenameTest {
+                timeline: 0,
+                sequence_number: 56014641572749563, // 0x00c701050d2a20fb
+                segment_size: base_two.pow(16),
+                expected: String::from("0000000000c7010500000d2a.wal"),
+            },
+        ];
+        for test in tests {
+            assert_eq!(
+                determine_segment_filename(
+                    &test.timeline,
+                    &test.sequence_number,
+                    &test.segment_size
+                ),
+                test.expected
+            );
+        }
+    }
+
+    struct FinalEntryAfterTest {
+        pub filename: String,
+        pub sequence_number: u64,
+        pub file_size: u64,
+        pub expected: bool,
+    }
+
+    #[test]
+    fn segment_final_entry_after() {
+        let base_two_u64: u64 = 2;
+        let tests = vec![
+            FinalEntryAfterTest {
+                filename: String::from("0000000000c7010500000d2a.wal"),
+                sequence_number: 0,
+                file_size: base_two_u64.pow(24),
+                expected: true,
+            },
+            FinalEntryAfterTest {
+                filename: String::from("000000000000000000000000.wal"),
+                sequence_number: 65,
+                file_size: base_two_u64.pow(6),
+                expected: false,
+            },
+            FinalEntryAfterTest {
+                filename: String::from("0000000000c7010500000d2a.wal"),
+                sequence_number: 56014641572741120,
+                file_size: base_two_u64.pow(24),
+                expected: true,
+            },
+            FinalEntryAfterTest {
+                filename: String::from("0000000000c7010500000d2a.wal"),
+                sequence_number: 0x00c70105 * base_two_u64.pow(32) + 0xd2b * base_two_u64.pow(24),
+                file_size: base_two_u64.pow(24),
+                expected: false,
+            },
+        ];
+        for test in tests {
+            assert_eq!(
+                final_entry_after(&test.filename, test.file_size, &test.sequence_number),
+                test.expected
+            );
+        }
     }
 }
-
-/*
-1. determine_segment_filename
-2. final_entry_after
-3. Segment
-    1. append
-        1. Check if size ok
-        2. Empty buf
-        3. One entry
-        4. Exceeding max_size should be impossible -> panic or error
-    2. pad
-        1. Resulting file size is exactly max_size
-    3. Internal file_size equals file size according to OS
-    3. read_parse_validate both versions
-    4. parse_validate_wal_entries -> done
-4. WalEntry
-    1. to_bytes -> done
-    2. from_bytes -> done
-
-*/
+// TODO: read_parse_validate both versions (from offset and partial entry)
