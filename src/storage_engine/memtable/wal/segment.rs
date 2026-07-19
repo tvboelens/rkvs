@@ -301,7 +301,7 @@ impl From<FromUtf8Error> for RecoveryError {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::{self, DirBuilder, File};
+    use std::fs::{self, DirBuilder, File, OpenOptions};
     use std::io;
     use std::path::PathBuf;
 
@@ -723,6 +723,117 @@ mod tests {
         assert_eq!(metadata.len(), segment_size as u64);
     }
 
+    #[test]
+    fn segment_read_parse_validate_from_offset() {
+        let entries = vec![
+            WalEntry {
+                key: String::from("key1"),
+                operation_type: OpType::Put,
+                sequence_number: 0,
+                value: Some(String::from("value1")),
+            },
+            WalEntry {
+                key: String::from("key2"),
+                operation_type: OpType::Delete,
+                sequence_number: 35, // bytes len of previous entry = 35
+                value: None,
+            },
+            WalEntry {
+                key: String::from("key3"),
+                operation_type: OpType::Put,
+                sequence_number: 60, // bytes len of previous entry = 25
+                value: Some(String::from("value2")),
+            },
+            WalEntry {
+                key: String::from("key3"),
+                operation_type: OpType::Put,
+                sequence_number: 95, // bytes len of previous entry = 35
+                value: Some(String::from("value3")),
+            },
+        ];
+        let dir = PathBuf::from("./segment_read_parse_validate_from_offset");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 4096;
+        assert!(cl.setup().is_ok());
+        let filename = determine_segment_filename(&0, &0, &segment_size);
+        let fp = dir.join(filename);
+        let file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create(true)
+            .open(fp)
+            .unwrap();
+        let mut segment = Segment::new(file, segment_size);
+        for entry in &entries {
+            segment.append(&entry.to_bytes()).unwrap()
+        }
+        assert_eq!(segment.file_size, 130);
+        let mut entries_read = Vec::<WalEntry>::new();
+        let res = segment
+            .read_parse_validate_from_offset(&mut entries_read, 35)
+            .unwrap();
+        assert!(matches!(res, None));
+        assert_eq!(entries[1..], entries_read);
+    }
+
+    #[test]
+    fn segment_read_parse_validate_from_partial_record() {
+        let entries = vec![
+            WalEntry {
+                key: String::from("key1"),
+                operation_type: OpType::Put,
+                sequence_number: 0,
+                value: Some(String::from("value1")),
+            },
+            WalEntry {
+                key: String::from("key2"),
+                operation_type: OpType::Delete,
+                sequence_number: 35, // bytes len of previous entry = 35
+                value: None,
+            },
+            WalEntry {
+                key: String::from("key3"),
+                operation_type: OpType::Put,
+                sequence_number: 60, // bytes len of previous entry = 25
+                value: Some(String::from("value2")),
+            },
+            WalEntry {
+                key: String::from("key3"),
+                operation_type: OpType::Put,
+                sequence_number: 95, // bytes len of previous entry = 35
+                value: Some(String::from("value3")),
+            },
+        ];
+        let dir = PathBuf::from("./segment_read_parse_validate_from_partial_record");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 4096;
+        assert!(cl.setup().is_ok());
+        let filename = determine_segment_filename(&0, &0, &segment_size);
+        let fp = dir.join(filename);
+        let file = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create(true)
+            .open(fp)
+            .unwrap();
+        let mut segment = Segment::new(file, segment_size);
+        let mut header = Vec::<u8>::new();
+        header.append(&mut entries[0].to_bytes()[0..HEADER_SIZE].to_vec());
+        let mut payload = Vec::<u8>::new();
+        payload.append(&mut entries[0].to_bytes()[HEADER_SIZE..].to_vec());
+        segment.append(&payload).unwrap();
+        for entry in &entries[1..] {
+            segment.append(&entry.to_bytes()).unwrap()
+        }
+        assert_eq!(segment.file_size, 117);
+        let mut entries_read = Vec::<WalEntry>::new();
+        let res = segment
+            .read_parse_validate_from_partial_record(header, &mut entries_read)
+            .unwrap();
+        assert!(matches!(res, None));
+        assert_eq!(entries, entries_read);
+    }
+
     struct FilenameTest {
         pub timeline: u32,
         pub sequence_number: u64,
@@ -816,4 +927,7 @@ mod tests {
         }
     }
 }
-// TODO: read_parse_validate both versions (from offset and partial entry)
+/*  TODO: read_parse_validate both versions (from offset and partial entry)
+    1. Normal -> done
+    2. truncated records at end
+*/
