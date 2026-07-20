@@ -67,10 +67,9 @@ impl Store for StorageEngine {
             sender: tx,
         };
         self.sender.send(job)?;
-        match rx.await {
-            Ok(res) => res.map_err(|_| StorageEngineError::IoError),
-            Err(_) => Err(StorageEngineError::Shutdown),
-        }
+        rx.await
+            .map_err(|_| StorageEngineError::Shutdown)
+            .and_then(|res| res.map_err(|_| StorageEngineError::IoError))
     }
 
     async fn put(&self, key: &String, value: String) -> Result<Option<String>, StorageEngineError> {
@@ -81,10 +80,9 @@ impl Store for StorageEngine {
             sender: tx,
         };
         self.sender.send(job)?;
-        match rx.await {
-            Ok(res) => res.map_err(|_| StorageEngineError::IoError),
-            Err(_) => Err(StorageEngineError::Shutdown),
-        }
+        rx.await
+            .map_err(|_| StorageEngineError::Shutdown)
+            .and_then(|res| res.map_err(|_| StorageEngineError::IoError))
     }
 
     async fn delete(&self, key: &String) -> Result<Option<String>, StorageEngineError> {
@@ -95,10 +93,9 @@ impl Store for StorageEngine {
             sender: tx,
         };
         self.sender.send(job)?;
-        match rx.await {
-            Ok(res) => res.map_err(|_| StorageEngineError::IoError),
-            Err(_) => Err(StorageEngineError::Shutdown),
-        }
+        rx.await
+            .map_err(|_| StorageEngineError::Shutdown)
+            .and_then(|res| res.map_err(|_| StorageEngineError::IoError))
     }
 }
 

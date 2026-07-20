@@ -114,13 +114,14 @@ where
     ) -> Result<Option<String>, StorageEngineError> {
         match op {
             Operation::Delete(key) => self.storage_engine.delete(&key).await,
-            Operation::Get(key) => match self.storage_engine.get(&key).await {
-                Ok(res) => match res {
+            Operation::Get(key) => self
+                .storage_engine
+                .get(&key)
+                .await
+                .and_then(|res| match res {
                     Some(value) => Ok(Some(value)),
                     None => Err(StorageEngineError::NotFound),
-                },
-                Err(e) => Err(e),
-            },
+                }),
             Operation::Put(data) => self.storage_engine.put(&data.key, data.value).await,
         }
     }
@@ -155,6 +156,7 @@ where
                 let correlation_id = request.headers.correlation_id.clone();
                 match self.handle_tcp_request(request).await {
                     Ok(res) => {
+                        // TODO: handle send response failure
                         self.send_response(res, &correlation_id).await;
                         KeepAliveStatus::KeepAlive
                     }
@@ -631,10 +633,10 @@ mod tests {
                 cmd: cmd,
                 sender: tx,
             };
-            match self.sender.send(job) {
-                Ok(_) => rx.await.map_err(|_| StorageEngineError::Shutdown),
-                Err(_) => Err(StorageEngineError::Shutdown),
-            }
+            self.sender
+                .send(job)
+                .map_err(|_| StorageEngineError::Shutdown)?;
+            rx.await.map_err(|_| StorageEngineError::Shutdown)
         }
 
         async fn delete(&self, key: &String) -> Result<Option<String>, StorageEngineError> {
@@ -644,10 +646,10 @@ mod tests {
                 cmd: cmd,
                 sender: tx,
             };
-            match self.sender.send(job) {
-                Ok(_) => rx.await.map_err(|_| StorageEngineError::Shutdown),
-                Err(_) => Err(StorageEngineError::Shutdown),
-            }
+            self.sender
+                .send(job)
+                .map_err(|_| StorageEngineError::Shutdown)?;
+            rx.await.map_err(|_| StorageEngineError::Shutdown)
         }
 
         async fn put(
@@ -661,10 +663,10 @@ mod tests {
                 cmd: cmd,
                 sender: tx,
             };
-            match self.sender.send(job) {
-                Ok(_) => rx.await.map_err(|_| StorageEngineError::Shutdown),
-                Err(_) => Err(StorageEngineError::Shutdown),
-            }
+            self.sender
+                .send(job)
+                .map_err(|_| StorageEngineError::Shutdown)?;
+            rx.await.map_err(|_| StorageEngineError::Shutdown)
         }
     }
 }

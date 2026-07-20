@@ -306,14 +306,11 @@ impl Payload {
         let key_len_u32: u32 = key_len.try_into().unwrap();
         buf[0..4].copy_from_slice(&key_len_u32.to_be_bytes());
         buf[4..key_len + 4].copy_from_slice(self.key.as_bytes());
-        match &self.value {
-            Some(value) => {
-                let value_len: u32 = value.len().try_into().unwrap();
-                buf[key_len + 4..key_len + 8].copy_from_slice(&value_len.to_be_bytes());
-                buf[key_len + 8..].copy_from_slice(value.as_bytes());
-            }
-            None => (),
-        }
+        let _ = self.value.as_ref().map(|value| {
+            let value_len: u32 = value.len() as u32;
+            buf[key_len + 4..key_len + 8].copy_from_slice(&value_len.to_be_bytes());
+            buf[key_len + 8..].copy_from_slice(value.as_bytes());
+        });
         buf
     }
     pub fn len(&self) -> usize {
