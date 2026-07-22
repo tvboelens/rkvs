@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, Write};
-use std::string::FromUtf8Error;
+use std::path::PathBuf;
 
 // length 4 bytes checksum 4 bytes key_len 4 bytes and op 1 bytes
 pub static HEADER_SIZE: usize = 3 * size_of::<u32>() + size_of::<u8>();
@@ -18,8 +18,10 @@ static CHECKSUM_ALG: crc::Algorithm<u32> = crc::Algorithm {
 
 pub struct Segment {
     file: File,
+    file_path: PathBuf,
     file_size: u32,
     max_size: u32,
+    base_lsn: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -31,7 +33,7 @@ pub enum OpType {
 #[derive(Debug)]
 pub enum RecoveryError {
     Io(io::Error),
-    Corrupted,
+    Corrupted(PathBuf, u64),
 }
 
 #[derive(Debug, PartialEq)]
@@ -77,9 +79,8 @@ pub fn determine_segment_filename(
 }
 
 pub fn final_entry_after(filename: &str, file_size: u64, sequence_number: &u64) -> bool {
-    let base_2: u64 = 2;
     let segment_no = u64::from_str_radix(&filename[16..24], 16).unwrap();
-    let base_offset = u64::from_str_radix(&filename[8..16], 16).unwrap() * base_2.pow(32);
+    let base_offset = u64::from_str_radix(&filename[8..16], 16).unwrap() * 2u64.pow(32);
     *sequence_number <= base_offset + file_size * segment_no
 }
 
@@ -97,22 +98,33 @@ impl Segment {
         self.append(buf.as_slice())
     }
 
-    pub fn new(file: File, max_size: u32) -> Self {
+    pub fn new(file: File, path: PathBuf, max_size: u32) -> Self {
         let metadata = file.metadata().unwrap();
         let file_size = metadata.len() as u32;
+        let filename = path.file_stem().map_or("", |s| s.to_str().unwrap_or(""));
+        assert_eq!(filename.len(), 24);
+        let base_lsn = u64::from_str_radix(&filename[8..16], 16).unwrap() * 2u64.pow(32);
+
         Segment {
             file: file,
+            file_path: path,
             file_size: file_size,
             max_size: max_size,
+            base_lsn: base_lsn,
         }
     }
 
-    pub fn from(mut file: File, file_size: u32, max_size: u32) -> Self {
+    pub fn from(mut file: File, path: PathBuf, file_size: u32, max_size: u32) -> Self {
         file.seek(io::SeekFrom::End(0)).unwrap();
+        let filename = path.file_stem().map_or("", |s| s.to_str().unwrap_or(""));
+        assert_eq!(filename.len(), 24);
+        let base_lsn = u64::from_str_radix(&filename[8..16], 16).unwrap() * 2u64.pow(32);
         Segment {
             file: file,
+            file_path: path,
             file_size: file_size,
             max_size: max_size,
+            base_lsn: base_lsn,
         }
     }
 
@@ -132,7 +144,7 @@ impl Segment {
         let mut bytes = Vec::<u8>::new();
         self.file.seek(io::SeekFrom::Start(offset as u64))?;
         self.file.read_to_end(&mut bytes)?;
-        Segment::parse_validate_wal_entries(&bytes, entries)
+        Segment::parse_validate_wal_entries(&self.file_path, &bytes, entries)
     }
 
     pub fn read_parse_validate_from_partial_record(
@@ -142,10 +154,11 @@ impl Segment {
     ) -> Result<Option<Vec<u8>>, RecoveryError> {
         self.file.seek(io::SeekFrom::Start(0))?;
         self.file.read_to_end(&mut bytes)?;
-        Segment::parse_validate_wal_entries(&bytes, entries)
+        Segment::parse_validate_wal_entries(&self.file_path, &bytes, entries)
     }
 
     fn parse_validate_wal_entries(
+        file_path: &PathBuf,
         bytes: &Vec<u8>,
         entries: &mut Vec<WalEntry>,
     ) -> Result<Option<Vec<u8>>, RecoveryError> {
@@ -156,10 +169,11 @@ impl Segment {
             if size_of::<u32>() + offset > bytes.len() {
                 break;
             }
+            let record_offset: u64 = offset as u64;
             u32_buf.copy_from_slice(&bytes[offset..offset + size_of::<u32>()]);
             record_len = u32::from_le_bytes(u32_buf) as usize;
             if record_len < HEADER_SIZE - size_of::<u32>() {
-                return Err(RecoveryError::Corrupted);
+                return Err(RecoveryError::Corrupted(file_path.clone(), record_offset));
             }
             if offset + size_of::<u32>() + record_len > bytes.len() {
                 break;
@@ -171,10 +185,11 @@ impl Segment {
             let calculated_checksum =
                 calculate_checksum(&bytes[offset..offset + record_len - size_of::<u32>()]);
             if read_checksum != calculated_checksum {
-                return Err(RecoveryError::Corrupted);
+                return Err(RecoveryError::Corrupted(file_path.clone(), record_offset));
             }
             let entry =
-                WalEntry::from_bytes(&bytes[offset..offset + record_len - size_of::<u32>()])?;
+                WalEntry::from_bytes(&bytes[offset..offset + record_len - size_of::<u32>()])
+                    .map_err(|_| RecoveryError::Corrupted(file_path.clone(), record_offset))?;
             entries.push(entry);
             offset += record_len - size_of::<u32>();
         }
@@ -183,6 +198,10 @@ impl Segment {
         } else {
             Ok(Some(bytes[offset..].to_vec()))
         }
+    }
+
+    pub fn next_lsn(&self) -> u64 {
+        self.base_lsn + self.file_size as u64
     }
 }
 
@@ -239,9 +258,9 @@ impl WalEntry {
         buf
     }
 
-    fn from_bytes(bytes: &[u8]) -> Result<Self, RecoveryError> {
+    fn from_bytes(bytes: &[u8]) -> Result<Self, ()> {
         if bytes.len() < 1 + size_of::<u32>() {
-            return Err(RecoveryError::Corrupted);
+            return Err(());
         }
         let mut u32_buf: [u8; 4] = [0, 0, 0, 0];
         let mut offset: usize = 1;
@@ -255,9 +274,10 @@ impl WalEntry {
         let key_len = u32::from_le_bytes(u32_buf);
         offset += size_of::<u32>();
         if bytes.len() < offset + key_len as usize {
-            return Err(RecoveryError::Corrupted);
+            return Err(());
         }
-        let key = String::from_utf8(bytes[offset..offset + key_len as usize].to_vec())?;
+        let key =
+            String::from_utf8(bytes[offset..offset + key_len as usize].to_vec()).map_err(|_| ())?;
         offset += key_len as usize;
         let mut value = None;
         if offset + size_of::<u64>() < bytes.len() {
@@ -265,15 +285,16 @@ impl WalEntry {
             offset += size_of::<u32>();
             let value_len = u32::from_le_bytes(u32_buf);
             if bytes.len() < offset + value_len as usize {
-                return Err(RecoveryError::Corrupted);
+                return Err(());
             }
-            value = Some(String::from_utf8(
-                bytes[offset..offset + value_len as usize].to_vec(),
-            )?);
+            value = Some(
+                String::from_utf8(bytes[offset..offset + value_len as usize].to_vec())
+                    .map_err(|_| ())?,
+            );
             offset += value_len as usize;
         }
         if bytes.len() < offset + 8 {
-            return Err(RecoveryError::Corrupted);
+            return Err(());
         }
         let mut u64_buf: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
         u64_buf.copy_from_slice(&bytes[offset..]);
@@ -293,12 +314,6 @@ impl From<io::Error> for RecoveryError {
     }
 }
 
-impl From<FromUtf8Error> for RecoveryError {
-    fn from(_: FromUtf8Error) -> Self {
-        RecoveryError::Corrupted
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -309,6 +324,17 @@ mod tests {
         HEADER_SIZE, OpType, RecoveryError, Segment, WalEntry, determine_segment_filename,
         final_entry_after,
     };
+
+    impl WalEntry {
+        fn bytes_len(&self) -> usize {
+            match self.value.as_ref() {
+                None => HEADER_SIZE + size_of::<u64>() + self.key.len(),
+                Some(value) => {
+                    HEADER_SIZE + size_of::<u32>() + size_of::<u64>() + self.key.len() + value.len()
+                }
+            }
+        }
+    }
 
     struct Cleanup {
         dir: PathBuf,
@@ -405,7 +431,7 @@ mod tests {
         };
         let bytes = write_entry.to_bytes();
         let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..HEADER_SIZE - 2]);
-        assert!(matches!(read_entry, Err(RecoveryError::Corrupted)));
+        assert!(matches!(read_entry, Err(())));
     }
 
     #[test]
@@ -418,7 +444,7 @@ mod tests {
         };
         let bytes = write_entry.to_bytes();
         let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..HEADER_SIZE + 1]);
-        assert!(matches!(read_entry, Err(RecoveryError::Corrupted)));
+        assert!(matches!(read_entry, Err(())));
     }
 
     #[test]
@@ -431,7 +457,7 @@ mod tests {
         };
         let bytes = write_entry.to_bytes();
         let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..HEADER_SIZE + 4]);
-        assert!(matches!(read_entry, Err(RecoveryError::Corrupted)));
+        assert!(matches!(read_entry, Err(())));
     }
 
     #[test]
@@ -444,7 +470,7 @@ mod tests {
         };
         let bytes = write_entry.to_bytes();
         let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..HEADER_SIZE + 8]);
-        assert!(matches!(read_entry, Err(RecoveryError::Corrupted)));
+        assert!(matches!(read_entry, Err(())));
     }
 
     #[test]
@@ -457,7 +483,7 @@ mod tests {
         };
         let bytes = write_entry.to_bytes();
         let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..bytes.len() - 2]);
-        assert!(matches!(read_entry, Err(RecoveryError::Corrupted)));
+        assert!(matches!(read_entry, Err(())));
     }
 
     #[test]
@@ -470,7 +496,7 @@ mod tests {
         };
         let bytes = write_entry.to_bytes();
         let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..HEADER_SIZE - 2]);
-        assert!(matches!(read_entry, Err(RecoveryError::Corrupted)));
+        assert!(matches!(read_entry, Err(())));
     }
 
     #[test]
@@ -483,7 +509,7 @@ mod tests {
         };
         let bytes = write_entry.to_bytes();
         let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..HEADER_SIZE + 1]);
-        assert!(matches!(read_entry, Err(RecoveryError::Corrupted)));
+        assert!(matches!(read_entry, Err(())));
     }
 
     #[test]
@@ -496,7 +522,7 @@ mod tests {
         };
         let bytes = write_entry.to_bytes();
         let read_entry = WalEntry::from_bytes(&bytes[2 * size_of::<u32>()..bytes.len() - 4]);
-        assert!(matches!(read_entry, Err(RecoveryError::Corrupted)));
+        assert!(matches!(read_entry, Err(())));
     }
 
     #[test]
@@ -524,7 +550,8 @@ mod tests {
             bytes.append(&mut entry.to_bytes());
         }
         let mut wal_entries_read = Vec::<WalEntry>::new();
-        let res = Segment::parse_validate_wal_entries(&bytes, &mut wal_entries_read);
+        let res =
+            Segment::parse_validate_wal_entries(&PathBuf::new(), &bytes, &mut wal_entries_read);
         assert!(matches!(res, Ok(None)));
         assert_eq!(wal_entries_read, wal_entries_write);
     }
@@ -549,6 +576,11 @@ mod tests {
                 });
             }
         }
+        let offset: usize = wal_entries_write
+            .iter()
+            .filter(|entry| entry.sequence_number < 500)
+            .map(|entry| entry.bytes_len())
+            .sum();
         let mut bytes = Vec::<u8>::new();
         for entry in &wal_entries_write {
             if entry.sequence_number == 500 {
@@ -560,8 +592,11 @@ mod tests {
             }
         }
         let mut wal_entries_read = Vec::<WalEntry>::new();
-        let res = Segment::parse_validate_wal_entries(&bytes, &mut wal_entries_read);
-        assert!(matches!(res, Err(RecoveryError::Corrupted)));
+        let path = PathBuf::new();
+        let res = Segment::parse_validate_wal_entries(&path, &bytes, &mut wal_entries_read);
+        assert!(
+            matches!(res, Err(RecoveryError::Corrupted(_, _offset)) if _offset == offset as u64)
+        );
         assert_eq!(wal_entries_read.len(), 500);
         assert_eq!(wal_entries_read, wal_entries_write[0..500]);
     }
@@ -586,6 +621,11 @@ mod tests {
                 });
             }
         }
+        let offset: usize = wal_entries_write
+            .iter()
+            .filter(|entry| entry.sequence_number < 500)
+            .map(|entry| entry.bytes_len())
+            .sum();
         let mut bytes = Vec::<u8>::new();
         for entry in &wal_entries_write {
             if entry.sequence_number == 500 {
@@ -596,8 +636,11 @@ mod tests {
             }
         }
         let mut wal_entries_read = Vec::<WalEntry>::new();
-        let res = Segment::parse_validate_wal_entries(&bytes, &mut wal_entries_read);
-        assert!(matches!(res, Err(RecoveryError::Corrupted)));
+        let path = PathBuf::new();
+        let res = Segment::parse_validate_wal_entries(&path, &bytes, &mut wal_entries_read);
+        assert!(
+            matches!(res, Err(RecoveryError::Corrupted(_, _offset)) if _offset == offset as u64)
+        );
         assert_eq!(wal_entries_read.len(), 500);
         assert_eq!(wal_entries_read, wal_entries_write[0..500]);
     }
@@ -632,7 +675,8 @@ mod tests {
             }
         }
         let mut wal_entries_read = Vec::<WalEntry>::new();
-        let res = Segment::parse_validate_wal_entries(&bytes, &mut wal_entries_read);
+        let path = PathBuf::new();
+        let res = Segment::parse_validate_wal_entries(&path, &bytes, &mut wal_entries_read);
         assert_eq!(wal_entries_read.len(), wal_entries_write.len() - 1);
         assert_eq!(
             wal_entries_read,
@@ -677,7 +721,8 @@ mod tests {
             }
         }
         let mut wal_entries_read = Vec::<WalEntry>::new();
-        let res = Segment::parse_validate_wal_entries(&bytes, &mut wal_entries_read);
+        let path = PathBuf::new();
+        let res = Segment::parse_validate_wal_entries(&path, &bytes, &mut wal_entries_read);
         assert_eq!(wal_entries_read.len(), wal_entries_write.len() - 1);
         assert_eq!(
             wal_entries_read,
@@ -711,6 +756,11 @@ mod tests {
                 });
             }
         }
+        let offset: usize = wal_entries_write
+            .iter()
+            .filter(|entry| entry.sequence_number < 5)
+            .map(|entry| entry.bytes_len())
+            .sum();
         let mut bytes = Vec::<u8>::new();
         for entry in &wal_entries_write {
             if entry.sequence_number == 5 {
@@ -723,8 +773,11 @@ mod tests {
             }
         }
         let mut wal_entries_read = Vec::<WalEntry>::new();
-        let res = Segment::parse_validate_wal_entries(&bytes, &mut wal_entries_read);
-        assert!(matches!(res, Err(RecoveryError::Corrupted)));
+        let path = PathBuf::new();
+        let res = Segment::parse_validate_wal_entries(&path, &bytes, &mut wal_entries_read);
+        assert!(
+            matches!(res, Err(RecoveryError::Corrupted(_, _offset)) if _offset == offset as u64)
+        );
         assert_eq!(wal_entries_read.len(), 5);
         assert_eq!(wal_entries_read, wal_entries_write[0..5]);
     }
@@ -737,8 +790,8 @@ mod tests {
         assert!(cl.setup().is_ok());
         let filename = determine_segment_filename(&0, &0, &segment_size);
         let fp = dir.join(filename);
-        let file = File::create(fp).unwrap();
-        let mut segment = Segment::new(file, segment_size);
+        let file = File::create(&fp).unwrap();
+        let mut segment = Segment::new(file, fp, segment_size);
         segment.append(vec![0, 1, 2, 3].as_slice()).unwrap();
         assert_eq!(segment.file_size, 4);
     }
@@ -751,8 +804,8 @@ mod tests {
         assert!(cl.setup().is_ok());
         let filename = determine_segment_filename(&0, &0, &segment_size);
         let fp = dir.join(filename);
-        let file = File::create(fp).unwrap();
-        let mut segment = Segment::new(file, segment_size);
+        let file = File::create(&fp).unwrap();
+        let mut segment = Segment::new(file, fp, segment_size);
         let buf = Vec::new();
         segment.append(&buf).unwrap();
         assert_eq!(segment.file_size, 0);
@@ -766,8 +819,8 @@ mod tests {
         assert!(cl.setup().is_ok());
         let filename = determine_segment_filename(&0, &0, &segment_size);
         let fp = dir.join(filename);
-        let file = File::create(fp).unwrap();
-        let mut segment = Segment::new(file, segment_size);
+        let file = File::create(&fp).unwrap();
+        let mut segment = Segment::new(file, fp, segment_size);
         let bytes = WalEntry {
             operation_type: OpType::Put,
             key: String::from("key"),
@@ -788,8 +841,8 @@ mod tests {
         assert!(cl.setup().is_ok());
         let filename = determine_segment_filename(&0, &0, &segment_size);
         let fp = dir.join(filename);
-        let file = File::create(fp).unwrap();
-        let mut segment = Segment::new(file, segment_size);
+        let file = File::create(&fp).unwrap();
+        let mut segment = Segment::new(file, fp, segment_size);
         let _ = segment.append(vec![0, 1, 2, 3].as_slice());
     }
 
@@ -801,9 +854,9 @@ mod tests {
         assert!(cl.setup().is_ok());
         let filename = determine_segment_filename(&0, &0, &segment_size);
         let fp = dir.join(filename);
-        let file = File::create(fp).unwrap();
+        let file = File::create(&fp).unwrap();
         let segment_file = file.try_clone().unwrap();
-        let mut segment = Segment::new(file, segment_size);
+        let mut segment = Segment::new(file, fp, segment_size);
         segment.append(vec![0, 1, 2, 3].as_slice()).unwrap();
         assert_eq!(segment.file_size, 4);
         segment.pad().unwrap();
@@ -850,9 +903,9 @@ mod tests {
             .write(true)
             .read(true)
             .create(true)
-            .open(fp)
+            .open(&fp)
             .unwrap();
-        let mut segment = Segment::new(file, segment_size);
+        let mut segment = Segment::new(file, fp, segment_size);
         for entry in &entries {
             segment.append(&entry.to_bytes()).unwrap()
         }
@@ -903,9 +956,9 @@ mod tests {
             .write(true)
             .read(true)
             .create(true)
-            .open(fp)
+            .open(&fp)
             .unwrap();
-        let mut segment = Segment::new(file, segment_size);
+        let mut segment = Segment::new(file, fp, segment_size);
         for entry in &entries {
             segment.append(&entry.to_bytes()).unwrap()
         }
@@ -965,9 +1018,9 @@ mod tests {
             .write(true)
             .read(true)
             .create(true)
-            .open(fp)
+            .open(&fp)
             .unwrap();
-        let mut segment = Segment::new(file, segment_size);
+        let mut segment = Segment::new(file, fp, segment_size);
         for entry in &entries {
             segment.append(&entry.to_bytes()).unwrap()
         }
@@ -1033,9 +1086,9 @@ mod tests {
             .write(true)
             .read(true)
             .create(true)
-            .open(fp)
+            .open(&fp)
             .unwrap();
-        let mut segment = Segment::new(file, segment_size);
+        let mut segment = Segment::new(file, fp, segment_size);
         let mut header = Vec::<u8>::new();
         header.append(&mut entries[0].to_bytes()[0..HEADER_SIZE].to_vec());
         let mut payload = Vec::<u8>::new();
@@ -1091,9 +1144,9 @@ mod tests {
             .write(true)
             .read(true)
             .create(true)
-            .open(fp)
+            .open(&fp)
             .unwrap();
-        let mut segment = Segment::new(file, segment_size);
+        let mut segment = Segment::new(file, fp, segment_size);
         let mut header = Vec::<u8>::new();
         header.append(&mut entries[0].to_bytes()[0..HEADER_SIZE].to_vec());
         let mut payload = Vec::<u8>::new();
@@ -1164,9 +1217,9 @@ mod tests {
             .write(true)
             .read(true)
             .create(true)
-            .open(fp)
+            .open(&fp)
             .unwrap();
-        let mut segment = Segment::new(file, segment_size);
+        let mut segment = Segment::new(file, fp, segment_size);
         let mut header = Vec::<u8>::new();
         header.append(&mut entries[0].to_bytes()[0..HEADER_SIZE].to_vec());
         let mut payload = Vec::<u8>::new();
@@ -1181,7 +1234,7 @@ mod tests {
             sequence_number: 130, // bytes len of previous entry = 35
             value: None,
         };
-        let mut buf = truncated_entry.to_bytes()[0..HEADER_SIZE].to_vec();
+        let buf = truncated_entry.to_bytes()[0..HEADER_SIZE].to_vec();
         segment.append(&buf).unwrap();
         assert_eq!(segment.file_size, 130);
         let mut entries_read = Vec::<WalEntry>::new();

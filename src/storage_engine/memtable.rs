@@ -1,4 +1,5 @@
-use std::fs::{File, read_dir};
+use std::fs::{self, File, OpenOptions, read_dir};
+use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::{collections::HashMap, io};
 use wal::segment::{OpType, RecoveryError, Segment, final_entry_after};
@@ -29,9 +30,9 @@ impl MemTable {
                 (sequence_number % segment_size as u64).try_into().unwrap(),
                 &mut table,
             ) {
-                // TODO: still need to initialize the WAL from the final segment
                 Ok(_) => {
-                    let wal = Wal::create_new(dir, segment_size)?;
+                    let segment = MemTable::open_last_segment(&dir, &segment_size)?;
+                    let wal = Wal::from_segment(dir, segment, segment_size);
                     return Ok(MemTable {
                         table: table,
                         wal: wal,
@@ -39,8 +40,14 @@ impl MemTable {
                 }
                 Err(e) => match e {
                     // TODO: this needs to be logged
-                    RecoveryError::Corrupted => {
-                        let wal = Wal::create_new(dir, segment_size)?;
+                    RecoveryError::Corrupted(fp, offset) => {
+                        let segment =
+                            MemTable::truncate_and_open_segment_file(fp, offset, segment_size)?;
+                        let file_paths = MemTable::list_segment_files(&dir, &segment.next_lsn())?;
+                        for fp in file_paths {
+                            fs::remove_file(fp)?;
+                        }
+                        let wal = Wal::from_segment(dir, segment, segment_size);
                         return Ok(MemTable {
                             table: table,
                             wal: wal,
@@ -68,20 +75,11 @@ impl MemTable {
             sequence_number: self.wal.next_sequence_number(),
         };
         self.wal.append(&entry)?;
-        match self.table.insert(key, Some(value)) {
-            Some(opt) => Ok(opt),
-            None => Ok(None),
-        }
+        Ok(self.table.insert(key, Some(value)).flatten())
     }
 
     pub fn get(&self, key: &String) -> Option<String> {
-        match self.table.get(key) {
-            Some(opt) => match opt {
-                Some(v) => Some(v.clone()),
-                None => None,
-            },
-            None => None,
-        }
+        self.table.get(key).cloned().flatten()
     }
 
     pub fn delete(&mut self, key: &String) -> io::Result<Option<String>> {
@@ -92,14 +90,7 @@ impl MemTable {
             sequence_number: self.wal.next_sequence_number(),
         };
         self.wal.append(&entry)?;
-        match self.table.insert(key.clone(), None) {
-            Some(opt) => Ok(opt),
-            None => Ok(None),
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.table.len()
+        Ok(self.table.insert(key.clone(), None).flatten())
     }
 
     pub fn sync(&mut self) -> io::Result<()> {
@@ -112,6 +103,77 @@ impl MemTable {
         sequence_number: &u64,
     ) -> io::Result<Vec<Segment>> {
         let mut segments = Vec::<Segment>::new();
+        let segment_file_paths = MemTable::list_segment_files(dir, sequence_number)?;
+        for fp in segment_file_paths {
+            let segment_file = File::open(&fp)?;
+            let file_size = segment_file.metadata()?.len();
+            if file_size <= *segment_size as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    "file size exceeded given max segment size",
+                ));
+            }
+            segments.push(Segment::from(
+                segment_file,
+                fp,
+                file_size as u32,
+                segment_size.clone(),
+            ));
+        }
+        Ok(segments)
+    }
+
+    fn open_last_segment(dir: &PathBuf, segment_size: &u32) -> io::Result<Segment> {
+        MemTable::list_segment_files(dir, &0)?.last().map_or(
+            Err(io::Error::from(io::ErrorKind::NotFound)),
+            |fp| {
+                let segment_file = OpenOptions::new().write(true).create(false).open(fp)?;
+                let file_size = segment_file.metadata()?.len();
+                if file_size <= *segment_size as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::FileTooLarge,
+                        "file size exceeded given max segment size",
+                    ));
+                }
+                Ok(Segment::from(
+                    segment_file,
+                    fp.clone(),
+                    file_size as u32,
+                    segment_size.clone(),
+                ))
+            },
+        )
+    }
+
+    fn truncate_and_open_segment_file(
+        segment_fp: PathBuf,
+        offset: u64,
+        segment_size: u32,
+    ) -> io::Result<Segment> {
+        let dir = segment_fp.parent().unwrap();
+        let mut segment_filepaths = MemTable::list_segment_files(&dir.to_path_buf(), &0)?;
+        segment_filepaths.sort();
+        let filtered_filepaths: Vec<&PathBuf> = segment_filepaths
+            .iter()
+            .filter(|p| segment_fp.cmp(p).is_le())
+            .collect();
+        if filtered_filepaths.is_empty() {
+            return Err(io::Error::from(ErrorKind::NotFound));
+        }
+        let segment_file = OpenOptions::new()
+            .write(true)
+            .create(false)
+            .open(&filtered_filepaths.first().unwrap())?;
+        segment_file.set_len(offset)?;
+        Ok(Segment::from(
+            segment_file,
+            filtered_filepaths.first().unwrap().to_path_buf(),
+            offset as u32,
+            segment_size,
+        ))
+    }
+
+    fn list_segment_files(dir: &PathBuf, sequence_number: &u64) -> io::Result<Vec<PathBuf>> {
         let mut segment_file_paths = Vec::<PathBuf>::new();
         for entry in read_dir(dir)? {
             let d = entry?;
@@ -126,22 +188,7 @@ impl MemTable {
             }
         }
         segment_file_paths.sort();
-        for fp in segment_file_paths {
-            let segment_file = File::open(fp)?;
-            let file_size = segment_file.metadata()?.len();
-            if file_size <= *segment_size as u64 {
-                return Err(io::Error::new(
-                    io::ErrorKind::FileTooLarge,
-                    "file size exceeded given max segment size",
-                ));
-            }
-            segments.push(Segment::from(
-                segment_file,
-                file_size as u32,
-                segment_size.clone(),
-            ));
-        }
-        Ok(segments)
+        Ok(segment_file_paths)
     }
 
     pub fn recover(
