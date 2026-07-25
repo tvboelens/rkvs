@@ -4,18 +4,6 @@ use std::path::PathBuf;
 
 pub mod segment;
 
-/*
-methods:
-1. sync -> done
-2. rotate
-3. recover?
-4. append
-    1. checksum
-    2. update file size
-5. new()
-6. Do I need synchronization or do we let the storage engine itself handle this?
-*/
-
 pub struct Wal {
     active_segment: Segment,
     segment_max_size: u32,
@@ -24,15 +12,6 @@ pub struct Wal {
 
 impl Wal {
     pub fn create_new(dir: PathBuf, segment_max_size: u32) -> io::Result<Self> {
-        /*
-        1. If we start from scratch, just create the first segment, return and start rw operations
-        2. If WAL files and SSTable present:
-            1. Find highest LSN from SSTable
-            2. Recover everything after this
-                1. Find segment containing this lsn
-                2. Then go to next lsn (possibly in next segment)
-                3. Then call recover()
-         */
         let filename = PathBuf::from(determine_segment_filename(&0, &0, &segment_max_size));
         let path = dir.join(filename);
         let file = std::fs::File::create(&path)?;
@@ -90,15 +69,4 @@ impl Wal {
         self.active_segment = Segment::new(file, path, self.segment_max_size);
         Ok(())
     }
-
-    /*
-    1. Check if SSTable files exist (separate function)
-        1. Yes -> get largest LSN
-        2. No -> largest LSN = 0
-    2. Check if WAL files exist
-        1. No -> new memtable, no recovery
-        2. Yes -> check if segments exist containing newer LSNs
-            1. No -> new memtable, no recovery
-            2. Yes -> recover
-     */
 }
