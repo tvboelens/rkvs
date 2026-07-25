@@ -101,7 +101,11 @@ impl Store for StorageEngine {
 
 impl StorageEngine {
     pub fn new(config: StorageEngineConf) -> io::Result<Self> {
-        let memtable = memtable::MemTable::start(config.dir, config.segment_size, 0)?;
+        let memtable = memtable::MemTable::start(
+            config.dir.join(PathBuf::from("WAL")),
+            config.segment_size,
+            0,
+        )?;
         let (tx, rx) = mpsc::channel();
 
         let mut worker = Worker {
