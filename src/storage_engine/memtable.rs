@@ -348,6 +348,56 @@ mod tests {
     }
 
     #[test]
+    fn recover_twice_single_segment() {
+        let dir = PathBuf::from("./memtable_recover_twice_single_segment");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 4096;
+        assert!(cl.setup().is_ok());
+        {
+            let mut memtable = MemTable::start(dir.clone(), segment_size.clone(), 0).unwrap();
+            let _ = memtable.put(String::from("key1"), String::from("value1"));
+            let _ = memtable.put(String::from("key1"), String::from("new_value1"));
+            let _ = memtable.put(String::from("key2"), String::from("value2"));
+            let _ = memtable.delete(&String::from("key2"));
+            let _ = memtable.put(String::from("key3"), String::from("value3"));
+        }
+        /*
+        key1: new_value1
+        key2: deleted
+        key3: value3
+        */
+
+        {
+            let mut memtable = MemTable::start(dir.clone(), segment_size.clone(), 0).unwrap();
+            let mut res = memtable.get(&String::from("key1"));
+            assert!(matches!(res, Some(value) if value == String::from("new_value1")));
+            res = memtable.get(&String::from("key2"));
+            assert!(matches!(res, None));
+            res = memtable.get(&String::from("key3"));
+            assert!(matches!(res, Some(value) if value == String::from("value3")));
+            let _ = memtable.put(String::from("key4"), String::from("value4"));
+            let _ = memtable.put(String::from("key2"), String::from("new_value2"));
+            let _ = memtable.delete(&String::from("key3"));
+        }
+        /*
+        key1: new_value1
+        key2: new_value2
+        key3: deleted
+        key4: value4
+        */
+
+        let memtable = MemTable::start(dir, segment_size.clone(), 0).unwrap();
+        let mut res = memtable.get(&String::from("key1"));
+        assert!(matches!(res, Some(value) if value == String::from("new_value1")));
+        res = memtable.get(&String::from("key2"));
+        assert!(matches!(res, Some(value) if value == String::from("new_value2")));
+        res = memtable.get(&String::from("key3"));
+        assert!(matches!(res, None));
+        res = memtable.get(&String::from("key4"));
+        assert!(matches!(res, Some(value) if value == String::from("value4")));
+    }
+
+    #[test]
     fn recover_multiple_segments() {
         let dir = PathBuf::from("./memtable_recover_multiple_segments");
         let cl = Cleanup { dir: dir.clone() };
@@ -370,4 +420,55 @@ mod tests {
         res = memtable.get(&String::from("key3"));
         assert!(matches!(res, Some(value) if value == String::from("value3")));
     }
+
+    #[test]
+    fn recover_twice_multiple_segments() {
+        let dir = PathBuf::from("./memtable_recover_twice_multiple_segments");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 4096;
+        assert!(cl.setup().is_ok());
+        {
+            let mut memtable = MemTable::start(dir.clone(), segment_size.clone(), 0).unwrap();
+            let _ = memtable.put(String::from("key1"), String::from("value1"));
+            let _ = memtable.put(String::from("key1"), String::from("new_value1"));
+            let _ = memtable.put(String::from("key2"), String::from("value2"));
+            let _ = memtable.delete(&String::from("key2"));
+            let _ = memtable.put(String::from("key3"), String::from("value3"));
+        }
+        /*
+        key1: new_value1
+        key2: deleted
+        key3: value3
+        */
+
+        {
+            let mut memtable = MemTable::start(dir.clone(), segment_size.clone(), 0).unwrap();
+            let mut res = memtable.get(&String::from("key1"));
+            assert!(matches!(res, Some(value) if value == String::from("new_value1")));
+            res = memtable.get(&String::from("key2"));
+            assert!(matches!(res, None));
+            res = memtable.get(&String::from("key3"));
+            assert!(matches!(res, Some(value) if value == String::from("value3")));
+            let _ = memtable.put(String::from("key4"), String::from("value4"));
+            let _ = memtable.put(String::from("key2"), String::from("new_value2"));
+            let _ = memtable.delete(&String::from("key3"));
+        }
+        /*
+        key1: new_value1
+        key2: new_value2
+        key3: deleted
+        key4: value4
+        */
+
+        let memtable = MemTable::start(dir, segment_size.clone(), 0).unwrap();
+        let mut res = memtable.get(&String::from("key1"));
+        assert!(matches!(res, Some(value) if value == String::from("new_value1")));
+        res = memtable.get(&String::from("key2"));
+        assert!(matches!(res, Some(value) if value == String::from("new_value2")));
+        res = memtable.get(&String::from("key3"));
+        assert!(matches!(res, None));
+        res = memtable.get(&String::from("key4"));
+        assert!(matches!(res, Some(value) if value == String::from("value4")));
+    }
+    // TODO: corrupted WAL
 }
