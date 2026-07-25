@@ -8,17 +8,10 @@ use wal::{Wal, segment::WalEntry};
 mod wal;
 
 pub struct MemTable {
+    // TODO: maybe need a custom data type, since we might want to store the LSN as well
     table: HashMap<String, Option<String>>,
     wal: wal::Wal,
 }
-
-/* impl Clone for MemTable {
-    fn clone(&self) -> Self {
-        MemTable {
-            table: self.table.clone(),
-        }
-    }
-} */
 
 impl MemTable {
     pub fn start(dir: PathBuf, segment_size: u32, sequence_number: u64) -> io::Result<Self> {
@@ -107,7 +100,7 @@ impl MemTable {
         for fp in segment_file_paths {
             let segment_file = File::open(&fp)?;
             let file_size = segment_file.metadata()?.len();
-            if file_size <= *segment_size as u64 {
+            if file_size > *segment_size as u64 {
                 return Err(io::Error::new(
                     io::ErrorKind::FileTooLarge,
                     "file size exceeded given max segment size",
@@ -129,7 +122,7 @@ impl MemTable {
             |fp| {
                 let segment_file = OpenOptions::new().write(true).create(false).open(fp)?;
                 let file_size = segment_file.metadata()?.len();
-                if file_size <= *segment_size as u64 {
+                if file_size > *segment_size as u64 {
                     return Err(io::Error::new(
                         io::ErrorKind::FileTooLarge,
                         "file size exceeded given max segment size",
@@ -179,7 +172,7 @@ impl MemTable {
             let d = entry?;
             if d.file_type()?.is_file()
                 && final_entry_after(
-                    d.path().to_str().unwrap(),
+                    d.file_name().to_str().unwrap(),
                     d.metadata()?.len(),
                     &sequence_number,
                 )
@@ -238,40 +231,124 @@ impl MemTable {
     }
 }
 
-/*
-Implementation thoughts
-1. Soft deletes
-    1. Not sure about this, since it is only the MemTable, for SSTable I would indeed prefer it
-    2. This probably depends on the the implementation. If we use a vector, then soft deletes are the better choice
-       from a performance standpoint, but for a hash map probably not.
-2. Metadata? I.e. use a custom struct instead of String as value?
-3. Using vector instead of HashMap?
-4. We would want to configure a maximum size for the MemTable so that we can flush to the SSTable when it is full
-
-Testing TODO:
-1. Table driven tests for crud operations
-    1. Added value can be retrieved
-    2. Absent value returns None both for get and delete
-    3. Updating existing key returns previous value
-2. Len method
-*/
-
-/* #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn put_get() {
-        let mut table = MemTable::new();
-        let key = String::from("key");
-        let key_read = key.clone();
-        let value = String::from("value");
-        let val_read = value.clone();
-        let result = table.put(key, value);
-        assert!(result.is_none());
-        let len = table.len();
-        assert_eq!(len, 1);
-        let res = table.get(&key_read);
-        assert!(res.is_some());
-        assert_eq!(res.unwrap(), val_read);
+    use std::fs::DirBuilder;
+    use std::path::PathBuf;
+
+    struct Cleanup {
+        dir: PathBuf,
     }
-} */
+
+    impl Cleanup {
+        fn setup(&self) -> io::Result<()> {
+            let _ = fs::remove_dir_all(&self.dir);
+            DirBuilder::new().recursive(true).create(&self.dir)
+        }
+    }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn basic_put_get() {
+        let dir = PathBuf::from("./memtable_basic_put_get");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 256;
+        assert!(cl.setup().is_ok());
+        let mut memtable = MemTable::start(dir, segment_size, 0).unwrap();
+        let res = memtable.put(String::from("key"), String::from("value"));
+        assert!(matches!(res, Ok(None)));
+        let v = memtable.get(&String::from("key"));
+        assert!(matches!(v, Some(value) if value == String::from("value")));
+    }
+
+    #[test]
+    fn put_twice() {
+        let dir = PathBuf::from("./memtable_put_twice");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 256;
+        assert!(cl.setup().is_ok());
+        let mut memtable = MemTable::start(dir, segment_size, 0).unwrap();
+        let res = memtable.put(String::from("key"), String::from("value1"));
+        assert!(matches!(res, Ok(None)));
+        let old_value = memtable.put(String::from("key"), String::from("value2"));
+        assert!(matches!(old_value, Ok(Some(value)) if value == String::from("value1")));
+        let v = memtable.get(&String::from("key"));
+        assert!(matches!(v, Some(value) if value == String::from("value2")));
+    }
+
+    #[test]
+    #[should_panic]
+    fn put_empty_key() {
+        let dir = PathBuf::from("./memtable_put_empty_key");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 256;
+        assert!(cl.setup().is_ok());
+        let mut memtable = MemTable::start(dir, segment_size, 0).unwrap();
+        let _ = memtable.put(String::from(""), String::from("value"));
+    }
+
+    #[test]
+    fn get_empty_key() {
+        let dir = PathBuf::from("./memtable_get_empty_key");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 256;
+        assert!(cl.setup().is_ok());
+        let memtable = MemTable::start(dir, segment_size, 0).unwrap();
+        let res = memtable.get(&String::from(""));
+        assert!(matches!(res, None));
+    }
+
+    #[test]
+    fn delete() {
+        let dir = PathBuf::from("./memtable_delete");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 256;
+        assert!(cl.setup().is_ok());
+        let mut memtable = MemTable::start(dir, segment_size, 0).unwrap();
+        let mut res = memtable.delete(&String::from("key"));
+        assert!(matches!(res, Ok(None)));
+        res = memtable.put(String::from("key"), String::from("value"));
+        assert!(matches!(res, Ok(None)));
+        let v = memtable.get(&String::from("key"));
+        assert!(matches!(v, Some(value) if value == String::from("value")));
+        res = memtable.delete(&String::from("key"));
+        assert!(matches!(res, Ok(Some(s)) if s == String::from("value")));
+        let value = memtable.get(&String::from("key"));
+        assert!(matches!(value, None));
+    }
+
+    #[test]
+    fn recover_single_segment() {
+        let dir = PathBuf::from("./memtable_recover_single_segment");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 4096;
+        assert!(cl.setup().is_ok());
+        {
+            let mut memtable = MemTable::start(dir.clone(), segment_size.clone(), 0).unwrap();
+            let _ = memtable.put(String::from("key1"), String::from("value1"));
+            let _ = memtable.put(String::from("key1"), String::from("new_value1"));
+            let _ = memtable.put(String::from("key2"), String::from("value2"));
+            let _ = memtable.delete(&String::from("key2"));
+            let _ = memtable.put(String::from("key3"), String::from("value3"));
+        }
+
+        let memtable = MemTable::start(dir, segment_size.clone(), 0).unwrap();
+        let mut res = memtable.get(&String::from("key1"));
+        assert!(matches!(res, Some(value) if value == String::from("new_value1")));
+        res = memtable.get(&String::from("key2"));
+        assert!(matches!(res, None));
+        res = memtable.get(&String::from("key3"));
+        assert!(matches!(res, Some(value) if value == String::from("value3")));
+    }
+}
+
+/*
+Implementation thoughts
+1.
+*/
