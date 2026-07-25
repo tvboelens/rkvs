@@ -103,7 +103,8 @@ impl Segment {
         let file_size = metadata.len() as u32;
         let filename = path.file_stem().map_or("", |s| s.to_str().unwrap_or(""));
         assert_eq!(filename.len(), 24);
-        let base_lsn = u64::from_str_radix(&filename[8..16], 16).unwrap() * 2u64.pow(32);
+        let base_lsn = u64::from_str_radix(&filename[8..16], 16).unwrap() * 2u64.pow(32)
+            + u64::from_str_radix(&filename[16..], 16).unwrap() * max_size as u64;
 
         Segment {
             file: file,
@@ -118,7 +119,8 @@ impl Segment {
         file.seek(io::SeekFrom::End(0)).unwrap();
         let filename = path.file_stem().map_or("", |s| s.to_str().unwrap_or(""));
         assert_eq!(filename.len(), 24);
-        let base_lsn = u64::from_str_radix(&filename[8..16], 16).unwrap() * 2u64.pow(32);
+        let base_lsn = u64::from_str_radix(&filename[8..16], 16).unwrap() * 2u64.pow(32)
+            + u64::from_str_radix(&filename[16..], 16).unwrap() * max_size as u64;
         Segment {
             file: file,
             file_path: path,
@@ -166,7 +168,8 @@ impl Segment {
         let mut record_len: usize;
         let mut u32_buf: [u8; size_of::<u32>()] = [0, 0, 0, 0];
         loop {
-            if size_of::<u32>() + offset > bytes.len() {
+            if HEADER_SIZE + offset > bytes.len() {
+                // padded
                 break;
             }
             let record_offset: u64 = offset as u64;
@@ -179,6 +182,7 @@ impl Segment {
                 break;
             }
             offset += size_of::<u32>();
+            // check integrity before deserializing
             u32_buf.copy_from_slice(&bytes[offset..offset + size_of::<u32>()]);
             let read_checksum = u32::from_le_bytes(u32_buf);
             offset += size_of::<u32>();
@@ -193,10 +197,10 @@ impl Segment {
             entries.push(entry);
             offset += record_len - size_of::<u32>();
         }
-        if offset == bytes.len() {
+        if offset == bytes.len() || offset + HEADER_SIZE > bytes.len() {
             Ok(None)
         } else {
-            Ok(Some(bytes[offset..].to_vec()))
+            Ok(Some(bytes[offset..offset + HEADER_SIZE].to_vec()))
         }
     }
 
@@ -557,6 +561,39 @@ mod tests {
     }
 
     #[test]
+    fn serde_multiple_wal_entries_pad_end() {
+        let mut wal_entries_write = Vec::<WalEntry>::new();
+        for n in 0..1000 {
+            if n % 7 == 0 {
+                wal_entries_write.push(WalEntry {
+                    operation_type: OpType::Put,
+                    key: String::from("key") + &n.to_string(),
+                    value: Some(String::from("value") + &n.to_string()),
+                    sequence_number: n as u64,
+                });
+            } else {
+                wal_entries_write.push(WalEntry {
+                    operation_type: OpType::Delete,
+                    key: String::from("key") + &n.to_string(),
+                    value: None,
+                    sequence_number: n as u64,
+                });
+            }
+        }
+        let mut bytes = Vec::<u8>::new();
+        for entry in &wal_entries_write {
+            bytes.append(&mut entry.to_bytes());
+        }
+        let mut padding_bytes: Vec<u8> = vec![0, 0, 0, 0];
+        bytes.append(&mut padding_bytes);
+        let mut wal_entries_read = Vec::<WalEntry>::new();
+        let res =
+            Segment::parse_validate_wal_entries(&PathBuf::new(), &bytes, &mut wal_entries_read);
+        assert!(matches!(res, Ok(None)));
+        assert_eq!(wal_entries_read, wal_entries_write);
+    }
+
+    #[test]
     fn serde_multiple_wal_entries_checksum_mismatch() {
         let mut wal_entries_write = Vec::<WalEntry>::new();
         for n in 0..1000 {
@@ -730,10 +767,10 @@ mod tests {
         );
         assert!(matches!(res, Ok(Some(_))));
         let bytes = res.unwrap().unwrap();
-        let mut truncated_bytes_padded =
-            wal_entries_write[wal_entries_write.len() - 1].to_bytes()[0..HEADER_SIZE].to_vec();
-        truncated_bytes_padded.resize(truncated_bytes_padded.len() + 4, 0);
-        assert_eq!(bytes, truncated_bytes_padded);
+        assert_eq!(
+            bytes,
+            wal_entries_write[wal_entries_write.len() - 1].to_bytes()[0..HEADER_SIZE].to_vec()
+        );
     }
 
     #[test]
@@ -1030,12 +1067,8 @@ mod tests {
             sequence_number: 130, // bytes len of previous entry = 35
             value: None,
         };
-        let mut buf = truncated_entry.to_bytes()[0..HEADER_SIZE].to_vec();
+        let buf = truncated_entry.to_bytes()[0..HEADER_SIZE].to_vec();
         segment.append(&buf).unwrap();
-        buf.resize(
-            buf.len() + (segment.max_size - segment.file_size) as usize,
-            0,
-        );
         segment.pad().unwrap();
 
         assert_eq!(segment.file_size, segment_size);
@@ -1161,12 +1194,8 @@ mod tests {
             sequence_number: 130, // bytes len of previous entry = 35
             value: None,
         };
-        let mut buf = truncated_entry.to_bytes()[0..HEADER_SIZE].to_vec();
+        let buf = truncated_entry.to_bytes()[0..HEADER_SIZE].to_vec();
         segment.append(&buf).unwrap();
-        buf.resize(
-            buf.len() + (segment.max_size - segment.file_size) as usize,
-            0,
-        );
         segment.pad().unwrap();
         assert_eq!(segment.file_size, segment_size);
         let mut entries_read = Vec::<WalEntry>::new();
