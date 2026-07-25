@@ -343,7 +343,7 @@ mod tests {
     impl Cleanup {
         fn setup(&self) -> io::Result<()> {
             let _ = fs::remove_dir_all(&self.dir);
-            DirBuilder::new().create(&self.dir)
+            DirBuilder::new().recursive(true).create(&self.dir)
         }
     }
 
@@ -784,7 +784,7 @@ mod tests {
 
     #[test]
     fn segment_append_ok() {
-        let dir = PathBuf::from("./Segment_Append_Ok");
+        let dir = PathBuf::from("./segment_append_ok");
         let cl = Cleanup { dir: dir.clone() };
         let segment_size = 256;
         assert!(cl.setup().is_ok());
@@ -798,7 +798,7 @@ mod tests {
 
     #[test]
     fn segment_append_empty() {
-        let dir = PathBuf::from("./Segment_Append_Empty");
+        let dir = PathBuf::from("./segment_append_empty");
         let cl = Cleanup { dir: dir.clone() };
         let segment_size = 256;
         assert!(cl.setup().is_ok());
@@ -813,7 +813,7 @@ mod tests {
 
     #[test]
     fn segment_append_one_entry() {
-        let dir = PathBuf::from("./Segment_Append_One_Entry");
+        let dir = PathBuf::from("./segment_append_one_entry");
         let cl = Cleanup { dir: dir.clone() };
         let segment_size = 256;
         assert!(cl.setup().is_ok());
@@ -835,7 +835,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn segment_append_too_large() {
-        let dir = PathBuf::from("./Segment_Append_Too_Large");
+        let dir = PathBuf::from("./segment_segment_append_too_large");
         let cl = Cleanup { dir: dir.clone() };
         let segment_size = 2;
         assert!(cl.setup().is_ok());
@@ -848,7 +848,7 @@ mod tests {
 
     #[test]
     fn segment_pad() {
-        let dir = PathBuf::from("./Segment_Pad");
+        let dir = PathBuf::from("./segment_pad");
         let cl = Cleanup { dir: dir.clone() };
         let segment_size = 256;
         assert!(cl.setup().is_ok());
