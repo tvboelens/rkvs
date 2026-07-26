@@ -7,9 +7,16 @@ use wal::{Wal, segment::WalEntry};
 
 mod wal;
 
+#[derive(Clone)]
+pub struct MemTableValue {
+    pub value: Option<String>,
+    pub deleted: bool,
+    sequence_number: u64,
+}
+
 pub struct MemTable {
     // TODO: maybe need a custom data type, since we might want to store the LSN as well
-    table: HashMap<String, Option<String>>,
+    table: HashMap<String, MemTableValue>,
     wal: wal::Wal,
 }
 
@@ -60,30 +67,42 @@ impl MemTable {
         }
     }
 
-    pub fn put(&mut self, key: String, value: String) -> io::Result<Option<String>> {
+    pub fn put(&mut self, key: String, value: String) -> io::Result<Option<MemTableValue>> {
+        let sequence_number = self.wal.next_sequence_number();
         let entry = WalEntry {
             operation_type: wal::segment::OpType::Put,
             key: key.clone(),
             value: Some(value.clone()),
-            sequence_number: self.wal.next_sequence_number(),
+            sequence_number: sequence_number.clone(),
         };
         self.wal.append(&entry)?;
-        Ok(self.table.insert(key, Some(value)).flatten())
+        let mvalue = MemTableValue {
+            value: Some(value),
+            deleted: false,
+            sequence_number: sequence_number,
+        };
+        Ok(self.table.insert(key, mvalue))
     }
 
-    pub fn get(&self, key: &String) -> Option<String> {
-        self.table.get(key).cloned().flatten()
+    pub fn get(&self, key: &String) -> Option<MemTableValue> {
+        self.table.get(key).cloned()
     }
 
-    pub fn delete(&mut self, key: &String) -> io::Result<Option<String>> {
+    pub fn delete(&mut self, key: &String) -> io::Result<Option<MemTableValue>> {
+        let sequence_number = self.wal.next_sequence_number();
         let entry = WalEntry {
             operation_type: wal::segment::OpType::Delete,
             key: key.clone(),
             value: None,
-            sequence_number: self.wal.next_sequence_number(),
+            sequence_number: sequence_number.clone(),
         };
         self.wal.append(&entry)?;
-        Ok(self.table.insert(key.clone(), None).flatten())
+        let mvalue = MemTableValue {
+            deleted: true,
+            sequence_number: sequence_number,
+            value: None,
+        };
+        Ok(self.table.insert(key.clone(), mvalue))
     }
 
     pub fn sync(&mut self) -> io::Result<()> {
@@ -187,7 +206,7 @@ impl MemTable {
     pub fn recover(
         segments: Vec<Segment>,
         starting_offset: u32,
-        table: &mut HashMap<String, Option<String>>,
+        table: &mut HashMap<String, MemTableValue>,
     ) -> Result<(), RecoveryError> {
         let mut offset = starting_offset;
         let mut partial_entry: Option<Vec<u8>> = None;
@@ -198,8 +217,22 @@ impl MemTable {
                     let res = segment.read_parse_validate_from_offset(&mut entries, offset);
                     for entry in entries {
                         match entry.operation_type {
-                            OpType::Delete => _ = table.remove(&entry.key),
-                            OpType::Put => _ = table.insert(entry.key, entry.value),
+                            OpType::Delete => {
+                                let value = MemTableValue {
+                                    deleted: true,
+                                    sequence_number: entry.sequence_number,
+                                    value: entry.value,
+                                };
+                                _ = table.insert(entry.key, value);
+                            }
+                            OpType::Put => {
+                                let value = MemTableValue {
+                                    deleted: false,
+                                    sequence_number: entry.sequence_number,
+                                    value: entry.value,
+                                };
+                                _ = table.insert(entry.key, value);
+                            }
                         }
                     }
                     offset = 0;
@@ -214,8 +247,22 @@ impl MemTable {
                     let res = segment.read_parse_validate_from_partial_record(bytes, &mut entries);
                     for entry in entries {
                         match entry.operation_type {
-                            OpType::Delete => _ = table.remove(&entry.key),
-                            OpType::Put => _ = table.insert(entry.key, entry.value),
+                            OpType::Delete => {
+                                let value = MemTableValue {
+                                    deleted: true,
+                                    sequence_number: entry.sequence_number,
+                                    value: entry.value,
+                                };
+                                _ = table.insert(entry.key, value);
+                            }
+                            OpType::Put => {
+                                let value = MemTableValue {
+                                    deleted: false,
+                                    sequence_number: entry.sequence_number,
+                                    value: entry.value,
+                                };
+                                _ = table.insert(entry.key, value);
+                            }
                         }
                     }
                     match res {
@@ -263,8 +310,9 @@ mod tests {
         let mut memtable = MemTable::start(dir, segment_size, 0).unwrap();
         let res = memtable.put(String::from("key"), String::from("value"));
         assert!(matches!(res, Ok(None)));
-        let v = memtable.get(&String::from("key"));
-        assert!(matches!(v, Some(value) if value == String::from("value")));
+        let v = memtable.get(&String::from("key")).unwrap();
+        assert!(!v.clone().deleted);
+        assert!(matches!(v.value, Some(value) if value == String::from("value")));
     }
 
     #[test]
@@ -277,9 +325,12 @@ mod tests {
         let res = memtable.put(String::from("key"), String::from("value1"));
         assert!(matches!(res, Ok(None)));
         let old_value = memtable.put(String::from("key"), String::from("value2"));
-        assert!(matches!(old_value, Ok(Some(value)) if value == String::from("value1")));
-        let v = memtable.get(&String::from("key"));
-        assert!(matches!(v, Some(value) if value == String::from("value2")));
+        assert!(
+            matches!(old_value, Ok(Some(value)) if value.clone().value.unwrap() == String::from("value1") && !value.deleted)
+        );
+        let v = memtable.get(&String::from("key")).unwrap();
+        assert!(!v.clone().deleted);
+        assert!(matches!(v.value, Some(value) if value == String::from("value2")));
     }
 
     #[test]
@@ -314,13 +365,23 @@ mod tests {
         let mut res = memtable.delete(&String::from("key"));
         assert!(matches!(res, Ok(None)));
         res = memtable.put(String::from("key"), String::from("value"));
-        assert!(matches!(res, Ok(None)));
+        // This is somewhat counterintuitive, but necessary if we delete keys that are in the sstables,
+        // but not in the memtable
+        assert!(matches!(res, Ok(Some(_))));
+        let mvalue = res.unwrap().unwrap();
+        assert!(matches!(mvalue.value, None));
+        assert!(mvalue.deleted);
         let v = memtable.get(&String::from("key"));
-        assert!(matches!(v, Some(value) if value == String::from("value")));
+        assert!(
+            matches!(v, Some(value) if value.clone().value.unwrap_or(String::from("")) == String::from("value") && !value.deleted)
+        );
         res = memtable.delete(&String::from("key"));
-        assert!(matches!(res, Ok(Some(s)) if s == String::from("value")));
-        let value = memtable.get(&String::from("key"));
-        assert!(matches!(value, None));
+        assert!(
+            matches!(res, Ok(Some(s)) if s.clone().value.unwrap_or(String::from("")) == String::from("value") && !s.deleted)
+        );
+        let value = memtable.get(&String::from("key")).unwrap();
+        assert!(matches!(value.value, None));
+        assert!(value.deleted);
     }
 
     #[test]
@@ -339,12 +400,15 @@ mod tests {
         }
 
         let memtable = MemTable::start(dir, segment_size.clone(), 0).unwrap();
-        let mut res = memtable.get(&String::from("key1"));
-        assert!(matches!(res, Some(value) if value == String::from("new_value1")));
-        res = memtable.get(&String::from("key2"));
-        assert!(matches!(res, None));
-        res = memtable.get(&String::from("key3"));
-        assert!(matches!(res, Some(value) if value == String::from("value3")));
+        let mut res = memtable.get(&String::from("key1")).unwrap();
+        assert!(matches!(res.value, Some(v) if v == String::from("new_value1")));
+        assert!(!res.deleted);
+        res = memtable.get(&String::from("key2")).unwrap();
+        assert!(matches!(res.value, None));
+        assert!(res.deleted);
+        res = memtable.get(&String::from("key3")).unwrap();
+        assert!(matches!(res.value, Some(v) if v == String::from("value3")));
+        assert!(!res.deleted);
     }
 
     #[test]
@@ -369,12 +433,15 @@ mod tests {
 
         {
             let mut memtable = MemTable::start(dir.clone(), segment_size.clone(), 0).unwrap();
-            let mut res = memtable.get(&String::from("key1"));
-            assert!(matches!(res, Some(value) if value == String::from("new_value1")));
-            res = memtable.get(&String::from("key2"));
-            assert!(matches!(res, None));
-            res = memtable.get(&String::from("key3"));
-            assert!(matches!(res, Some(value) if value == String::from("value3")));
+            let mut res = memtable.get(&String::from("key1")).unwrap();
+            assert!(matches!(res.value, Some(value) if value == String::from("new_value1")));
+            assert!(!res.deleted);
+            res = memtable.get(&String::from("key2")).unwrap();
+            assert!(matches!(res.value, None));
+            assert!(res.deleted);
+            res = memtable.get(&String::from("key3")).unwrap();
+            assert!(matches!(res.value, Some(value) if value == String::from("value3")));
+            assert!(!res.deleted);
             let _ = memtable.put(String::from("key4"), String::from("value4"));
             let _ = memtable.put(String::from("key2"), String::from("new_value2"));
             let _ = memtable.delete(&String::from("key3"));
@@ -387,14 +454,18 @@ mod tests {
         */
 
         let memtable = MemTable::start(dir, segment_size.clone(), 0).unwrap();
-        let mut res = memtable.get(&String::from("key1"));
-        assert!(matches!(res, Some(value) if value == String::from("new_value1")));
-        res = memtable.get(&String::from("key2"));
-        assert!(matches!(res, Some(value) if value == String::from("new_value2")));
-        res = memtable.get(&String::from("key3"));
-        assert!(matches!(res, None));
-        res = memtable.get(&String::from("key4"));
-        assert!(matches!(res, Some(value) if value == String::from("value4")));
+        let mut res = memtable.get(&String::from("key1")).unwrap();
+        assert!(matches!(res.value, Some(value) if value == String::from("new_value1")));
+        assert!(!res.deleted);
+        res = memtable.get(&String::from("key2")).unwrap();
+        assert!(matches!(res.value, Some(value) if value == String::from("new_value2")));
+        assert!(!res.deleted);
+        res = memtable.get(&String::from("key3")).unwrap();
+        assert!(matches!(res.value, None));
+        assert!(res.deleted);
+        res = memtable.get(&String::from("key4")).unwrap();
+        assert!(matches!(res.value, Some(value) if value == String::from("value4")));
+        assert!(!res.deleted);
     }
 
     #[test]
@@ -413,12 +484,15 @@ mod tests {
         }
 
         let memtable = MemTable::start(dir, segment_size.clone(), 0).unwrap();
-        let mut res = memtable.get(&String::from("key1"));
-        assert!(matches!(res, Some(value) if value == String::from("new_value1")));
-        res = memtable.get(&String::from("key2"));
-        assert!(matches!(res, None));
-        res = memtable.get(&String::from("key3"));
-        assert!(matches!(res, Some(value) if value == String::from("value3")));
+        let mut res = memtable.get(&String::from("key1")).unwrap();
+        assert!(!res.deleted);
+        assert!(matches!(res.value, Some(value) if value == String::from("new_value1")));
+        res = memtable.get(&String::from("key2")).unwrap();
+        assert!(matches!(res.value, None));
+        assert!(res.deleted);
+        res = memtable.get(&String::from("key3")).unwrap();
+        assert!(matches!(res.value, Some(value) if value == String::from("value3")));
+        assert!(!res.deleted)
     }
 
     #[test]
@@ -443,12 +517,15 @@ mod tests {
 
         {
             let mut memtable = MemTable::start(dir.clone(), segment_size.clone(), 0).unwrap();
-            let mut res = memtable.get(&String::from("key1"));
-            assert!(matches!(res, Some(value) if value == String::from("new_value1")));
-            res = memtable.get(&String::from("key2"));
-            assert!(matches!(res, None));
-            res = memtable.get(&String::from("key3"));
-            assert!(matches!(res, Some(value) if value == String::from("value3")));
+            let mut res = memtable.get(&String::from("key1")).unwrap();
+            assert!(matches!(res.value, Some(value) if value == String::from("new_value1")));
+            assert!(!res.deleted);
+            res = memtable.get(&String::from("key2")).unwrap();
+            assert!(matches!(res.value, None));
+            assert!(res.deleted);
+            res = memtable.get(&String::from("key3")).unwrap();
+            assert!(matches!(res.value, Some(value) if value == String::from("value3")));
+            assert!(!res.deleted);
             let _ = memtable.put(String::from("key4"), String::from("value4"));
             let _ = memtable.put(String::from("key2"), String::from("new_value2"));
             let _ = memtable.delete(&String::from("key3"));
@@ -461,14 +538,48 @@ mod tests {
         */
 
         let memtable = MemTable::start(dir, segment_size.clone(), 0).unwrap();
-        let mut res = memtable.get(&String::from("key1"));
-        assert!(matches!(res, Some(value) if value == String::from("new_value1")));
-        res = memtable.get(&String::from("key2"));
-        assert!(matches!(res, Some(value) if value == String::from("new_value2")));
-        res = memtable.get(&String::from("key3"));
-        assert!(matches!(res, None));
-        res = memtable.get(&String::from("key4"));
-        assert!(matches!(res, Some(value) if value == String::from("value4")));
+        let mut res = memtable.get(&String::from("key1")).unwrap();
+        assert!(matches!(res.value, Some(value) if value == String::from("new_value1")));
+        assert!(!res.deleted);
+        res = memtable.get(&String::from("key2")).unwrap();
+        assert!(matches!(res.value, Some(value) if value == String::from("new_value2")));
+        assert!(!res.deleted);
+        res = memtable.get(&String::from("key3")).unwrap();
+        assert!(matches!(res.value, None));
+        assert!(res.deleted);
+        res = memtable.get(&String::from("key4")).unwrap();
+        assert!(matches!(res.value, Some(value) if value == String::from("value4")));
+        assert!(!res.deleted);
     }
+
+    #[test]
+    fn recover_multiple_segments_higher_sequence_no() {
+        let dir = PathBuf::from("./memtable_recover_multiple_segments_higher_sequence_no");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 64;
+        assert!(cl.setup().is_ok());
+        let sequence_number: u64;
+        {
+            let mut memtable = MemTable::start(dir.clone(), segment_size.clone(), 0).unwrap();
+            let _ = memtable.put(String::from("key1"), String::from("value1")); // 0 -> 35
+            let _ = memtable.put(String::from("key1"), String::from("new_value1")); //35 -> 74
+            let _ = memtable.put(String::from("key2"), String::from("value2")); // 74 -> 109
+            let v = memtable.get(&String::from("key2")).unwrap();
+            sequence_number = v.sequence_number;
+            let _ = memtable.delete(&String::from("key2")); // 109 -> 134
+            let _ = memtable.put(String::from("key3"), String::from("value3")); // 134 -> 169
+        }
+
+        let memtable = MemTable::start(dir, segment_size.clone(), sequence_number).unwrap();
+        let res = memtable.get(&String::from("key1"));
+        assert!(matches!(res, None));
+        let res = memtable.get(&String::from("key2")).unwrap();
+        assert!(matches!(res.value, None));
+        assert!(res.deleted);
+        let res = memtable.get(&String::from("key3")).unwrap();
+        assert!(matches!(res.value, Some(value) if value == String::from("value3")));
+        assert!(!res.deleted);
+    }
+
     // TODO: corrupted WAL
 }

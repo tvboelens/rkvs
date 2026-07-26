@@ -153,7 +153,18 @@ impl Worker {
                         last_sync = Instant::now();
                         elapsed = self.timeout;
                     }
-                    job.sender.send(res).unwrap_or(())
+                    job.sender
+                        .send(res.map(|opt| {
+                            opt.map(|mvalue| {
+                                if mvalue.deleted {
+                                    return None;
+                                } else {
+                                    return mvalue.value;
+                                }
+                            })
+                            .flatten()
+                        }))
+                        .unwrap_or(())
                 }
             }
         }
