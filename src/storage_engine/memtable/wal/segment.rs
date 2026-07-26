@@ -80,8 +80,10 @@ pub fn determine_segment_filename(
 
 pub fn final_entry_after(filename: &str, file_size: u64, sequence_number: &u64) -> bool {
     let segment_no = u64::from_str_radix(&filename[16..24], 16).unwrap();
-    let base_offset = u64::from_str_radix(&filename[8..16], 16).unwrap() * 2u64.pow(32);
-    *sequence_number <= base_offset + file_size * segment_no
+    let logical_log_no = u64::from_str_radix(&filename[8..16], 16).unwrap();
+    // segment goes from logical_log_no * 2^32 + file_size * segment_no
+    // until logical_log_no * 2^32 + file_size * (segment_no + 1) - 1
+    *sequence_number < logical_log_no * 2u64.pow(32) + file_size * (segment_no + 1)
 }
 
 impl Segment {
