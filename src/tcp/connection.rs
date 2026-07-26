@@ -246,6 +246,16 @@ where
                 }
             }
         }
+    }
+}
+
+impl<T, U, V> Drop for TcpConnection<T, U, V>
+where
+    T: AsyncReadExt + Unpin,
+    U: AsyncWriteExt + Unpin,
+    V: Store,
+{
+    fn drop(&mut self) {
         let _ = self.sender.send(ConnectionData::CompletionSignal(self.id));
     }
 }
