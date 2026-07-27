@@ -5,7 +5,10 @@ use std::sync::mpsc::{RecvTimeoutError, SendError};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot::{Sender, channel};
 
+use sstable::SsTable;
+
 mod memtable;
+mod sstable;
 pub trait Store {
     fn get(
         &self,
@@ -41,6 +44,7 @@ pub struct StorageEngine {
 
 struct Worker {
     memtable: memtable::MemTable,
+    sstable: sstable::SsTable,
     receiver: mpsc::Receiver<Job>,
     timeout: Duration,
 }
@@ -107,9 +111,10 @@ impl StorageEngine {
             0,
         )?;
         let (tx, rx) = mpsc::channel();
-
+        let sstable = SsTable::start()?;
         let mut worker = Worker {
             memtable: memtable,
+            sstable: sstable,
             receiver: rx,
             timeout: config.timeout,
         };
@@ -143,9 +148,9 @@ impl Worker {
                 },
                 Ok(job) => {
                     let res = match job.command {
-                        Command::Delete(key) => self.memtable.delete(&key),
-                        Command::Get(key) => Ok(self.memtable.get(&key)),
-                        Command::Put(key, value) => self.memtable.put(key, value),
+                        Command::Delete(key) => self.delete(&key),
+                        Command::Get(key) => self.get(&key),
+                        Command::Put(key, value) => self.put(key, value),
                     };
                     elapsed -= Instant::now() - last_sync;
                     if elapsed.is_zero() {
@@ -153,21 +158,58 @@ impl Worker {
                         last_sync = Instant::now();
                         elapsed = self.timeout;
                     }
-                    job.sender
-                        .send(res.map(|opt| {
-                            opt.map(|mvalue| {
-                                if mvalue.deleted {
-                                    return None;
-                                } else {
-                                    return mvalue.value;
-                                }
-                            })
-                            .flatten()
-                        }))
-                        .unwrap_or(())
+                    job.sender.send(res).unwrap_or(())
                 }
             }
         }
+    }
+
+    fn get(&mut self, key: &String) -> io::Result<Option<String>> {
+        match self.memtable.get(key) {
+            Some(mvalue) => {
+                if mvalue.deleted {
+                    Ok(None)
+                } else {
+                    Ok(mvalue.value)
+                }
+            }
+            None => self.sstable.get(key).map(|opt| {
+                opt.map(|v| {
+                    if v.deleted {
+                        return None;
+                    } else {
+                        return v.value;
+                    }
+                })
+                .flatten()
+            }),
+        }
+    }
+
+    fn put(&mut self, key: String, value: String) -> io::Result<Option<String>> {
+        self.memtable.put(key, value).map(|opt| {
+            opt.map(|mvalue| {
+                if mvalue.deleted {
+                    return None;
+                } else {
+                    return mvalue.value;
+                }
+            })
+            .flatten()
+        })
+    }
+
+    fn delete(&mut self, key: &String) -> io::Result<Option<String>> {
+        self.memtable.delete(key).map(|opt| {
+            opt.map(|mvalue| {
+                if mvalue.deleted {
+                    return None;
+                } else {
+                    return mvalue.value;
+                }
+            })
+            .flatten()
+        })
     }
 }
 
