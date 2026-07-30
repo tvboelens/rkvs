@@ -1,8 +1,8 @@
+use std::future::Future;
 use std::io;
 use std::path::PathBuf;
-use std::sync::mpsc;
-use std::sync::mpsc::{RecvTimeoutError, SendError};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::SendError;
+use std::sync::{Arc, Mutex, mpsc};
 use tokio::sync::oneshot::{Sender, channel};
 
 use sstable::SsTable;
@@ -13,16 +13,16 @@ pub trait Store {
     fn get(
         &self,
         key: &String,
-    ) -> impl std::future::Future<Output = Result<Option<String>, StorageEngineError>> + Send;
+    ) -> impl Future<Output = Result<Option<String>, StorageEngineError>> + Send;
     fn put(
         &self,
         key: &String,
         value: String,
-    ) -> impl std::future::Future<Output = Result<Option<String>, StorageEngineError>> + Send;
+    ) -> impl Future<Output = Result<Option<String>, StorageEngineError>> + Send;
     fn delete(
         &self,
         key: &String,
-    ) -> impl std::future::Future<Output = Result<Option<String>, StorageEngineError>> + Send;
+    ) -> impl Future<Output = Result<Option<String>, StorageEngineError>> + Send;
 }
 
 enum Command {
@@ -39,18 +39,17 @@ struct Job {
 pub struct StorageEngine {
     //memtable: Arc<AtomicPtr<memtable::MemTable>>,
     sender: mpsc::Sender<Job>,
-    join_handle: std::thread::JoinHandle<()>,
+    join_handles: Vec<std::thread::JoinHandle<()>>,
 }
 
 struct Worker {
-    memtable: memtable::MemTable,
-    sstable: sstable::SsTable,
-    receiver: mpsc::Receiver<Job>,
-    timeout: Duration,
+    memtable: Arc<memtable::MemTable>,
+    sstable: Arc<sstable::SsTable>,
+    receiver: Arc<Mutex<mpsc::Receiver<Job>>>,
 }
 
 pub struct StorageEngineConf {
-    timeout: Duration,
+    //timeout: Duration,
     dir: PathBuf,
     segment_size: u32,
 }
@@ -111,105 +110,91 @@ impl StorageEngine {
             0,
         )?;
         let (tx, rx) = mpsc::channel();
+        let receiver = Arc::new(Mutex::new(rx));
         let sstable = SsTable::start()?;
-        let mut worker = Worker {
-            memtable: memtable,
-            sstable: sstable,
-            receiver: rx,
-            timeout: config.timeout,
+        let worker = Worker {
+            memtable: Arc::new(memtable),
+            sstable: Arc::new(sstable),
+            receiver: receiver,
         };
-        let handle = std::thread::spawn(move || worker.run());
+        let mut join_handles = Vec::new();
+        for _ in 0..6 {
+            let new_worker = worker.clone();
+            let handle = std::thread::spawn(move || new_worker.run());
+            join_handles.push(handle);
+        }
         Ok(StorageEngine {
-            //memtable: memtable_ptr.clone(),
             sender: tx,
-            join_handle: handle,
+            join_handles: join_handles,
         })
     }
 
     pub fn shutdown(self) {
         drop(self.sender);
-        self.join_handle.join().unwrap_or(());
+        for handle in self.join_handles {
+            // TODO: handle panics?
+            handle.join().unwrap_or(());
+        }
     }
 }
 
 impl Worker {
-    fn run(&mut self) {
-        let mut last_sync = Instant::now();
-        let mut elapsed = self.timeout;
+    fn run(&self) {
+        let mut job;
         loop {
-            match self.receiver.recv_timeout(elapsed) {
-                Err(error) => match error {
-                    RecvTimeoutError::Disconnected => break,
-                    RecvTimeoutError::Timeout => {
-                        self.memtable.sync().unwrap();
-                        last_sync = Instant::now();
-                        elapsed = self.timeout;
+            {
+                match self.receiver.lock() {
+                    Ok(receiver) => match receiver.recv() {
+                        Ok(j) => job = j,
+                        Err(_) => {
+                            break;
+                        }
+                    },
+                    Err(_) => {
+                        // TODO: handle poison error
+                        break;
                     }
-                },
-                Ok(job) => {
-                    let res = match job.command {
-                        Command::Delete(key) => self.delete(&key),
-                        Command::Get(key) => self.get(&key),
-                        Command::Put(key, value) => self.put(key, value),
-                    };
-                    elapsed -= Instant::now() - last_sync;
-                    if elapsed.is_zero() {
-                        self.memtable.sync().unwrap();
-                        last_sync = Instant::now();
-                        elapsed = self.timeout;
-                    }
-                    job.sender.send(res).unwrap_or(())
                 }
             }
+            let res = match job.command {
+                Command::Delete(key) => self.delete(&key),
+                Command::Get(key) => self.get(&key),
+                Command::Put(key, value) => self.put(key, value),
+            };
+            job.sender.send(res).unwrap_or(())
         }
     }
 
-    fn get(&mut self, key: &String) -> io::Result<Option<String>> {
+    fn get(&self, key: &String) -> io::Result<Option<String>> {
         match self.memtable.get(key) {
-            Some(mvalue) => {
-                if mvalue.deleted {
-                    Ok(None)
-                } else {
-                    Ok(mvalue.value)
-                }
-            }
-            None => self.sstable.get(key).map(|opt| {
-                opt.map(|v| {
-                    if v.deleted {
-                        return None;
-                    } else {
-                        return v.value;
-                    }
-                })
-                .flatten()
-            }),
+            Some(mvalue) => Ok(mvalue.value),
+            None => self
+                .sstable
+                .get(key)
+                .map(|opt| opt.map(|entry| entry.value).flatten()),
         }
     }
 
-    fn put(&mut self, key: String, value: String) -> io::Result<Option<String>> {
-        self.memtable.put(key, value).map(|opt| {
-            opt.map(|mvalue| {
-                if mvalue.deleted {
-                    return None;
-                } else {
-                    return mvalue.value;
-                }
-            })
-            .flatten()
-        })
+    fn put(&self, key: String, value: String) -> io::Result<Option<String>> {
+        self.memtable
+            .put(key, value)
+            .map(|opt| opt.map(|mvalue| mvalue.value).flatten())
     }
 
-    fn delete(&mut self, key: &String) -> io::Result<Option<String>> {
-        self.memtable.delete(key).map(|opt| {
-            opt.map(|mvalue| {
-                if mvalue.deleted {
-                    return None;
-                } else {
-                    return mvalue.value;
-                }
-            })
-            .flatten()
-        })
+    fn delete(&self, key: &String) -> io::Result<Option<String>> {
+        self.memtable
+            .delete(key)
+            .map(|opt| opt.map(|mvalue| mvalue.value).flatten())
+    }
+}
+
+impl Clone for Worker {
+    fn clone(&self) -> Self {
+        Worker {
+            memtable: self.memtable.clone(),
+            sstable: self.sstable.clone(),
+            receiver: self.receiver.clone(),
+        }
     }
 }
 
