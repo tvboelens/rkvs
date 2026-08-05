@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -10,20 +10,31 @@ struct Segment {
     file: File,
     index: SegmentIndex,
     highest_sequence_no: u64,
+    size: u64,
 }
 
-trait LevelSearch {
+trait Level {
     fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>>;
+    fn segments_to_merge(&self) -> Vec<Arc<Segment>>;
+    fn merge(
+        &self,
+        segments: &Vec<Arc<Segment>>,
+    ) -> io::Result<(Arc<SsTableLevel<PartitionedLevel>>, Vec<Arc<Segment>>)>;
+    fn exceeds_target_size(&self) -> bool;
 }
 
-struct OverlappingLevel {}
+struct OverlappingLevel {
+    segments: Vec<Arc<Segment>>,
+    target_size: u64,
+}
 struct PartitionedLevel {
     segments: Vec<Arc<Segment>>,
+    target_size: u64,
 }
 
 struct SsTableLevel<T>
 where
-    T: LevelSearch,
+    T: Level,
 {
     inner: T,
 }
@@ -34,9 +45,14 @@ pub struct SsTableEntry {
     pub sequence_number: u64,
 }
 
+struct CompactionBt {
+    container: Arc<RwLock<LevelContainer>>,
+    segments_to_delete: Vec<Arc<Segment>>,
+}
+
 struct LevelContainer {
     level_zero: Arc<SsTableLevel<OverlappingLevel>>,
-    higher_levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>,
+    partitioned_levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>,
 }
 
 pub struct SsTable {
@@ -48,50 +64,45 @@ impl LevelContainer {
         self.level_zero.clone()
     }
 
-    fn higher_levels(&self) -> Vec<Arc<SsTableLevel<PartitionedLevel>>> {
-        self.higher_levels.clone()
+    fn partitioned_levels(&self) -> Vec<Arc<SsTableLevel<PartitionedLevel>>> {
+        self.partitioned_levels.clone()
     }
 
-    fn swap_higher_levels(&mut self, new_higher_levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>) {
-        self.higher_levels = new_higher_levels;
-    }
-
-    fn add_compacted_level_zero(
+    fn swap_partitioned_levels(
         &mut self,
-        new_level_zero: Arc<SsTableLevel<OverlappingLevel>>,
-        compacted_level_zero: Arc<SsTableLevel<PartitionedLevel>>,
+        new_partitioned_levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>,
     ) {
-        self.level_zero = new_level_zero;
-        // Insert new level at the front
-        self.higher_levels.reverse();
-        self.higher_levels.push(compacted_level_zero);
-        self.higher_levels.reverse();
+        self.partitioned_levels = new_partitioned_levels;
+    }
+
+    fn swap_all_levels(
+        &mut self,
+        new_partitioned_levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>,
+    ) {
+        let target_size = self.level_zero.inner.target_size;
+        self.level_zero = Arc::new(SsTableLevel::<OverlappingLevel>::new(target_size));
+        self.partitioned_levels = new_partitioned_levels;
     }
 }
 
 impl SsTable {
-    /* pub fn start() -> io::Result<Self> {
-        Ok(SsTable {
-            higher_levels: Vec::new(),
-            level_zero: SsTableLevel {
-                inner: OverlappingLevel {},
-            },
-        })
-    } */
+    pub fn start() -> io::Result<Self> {
+        todo!()
+    }
 
     pub fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>> {
         let level_zero: Arc<SsTableLevel<OverlappingLevel>>;
-        let higher_levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>;
+        let partitioned_levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>;
         {
             let lock = self.inner.read().unwrap();
             level_zero = lock.level_zero();
-            higher_levels = lock.higher_levels();
+            partitioned_levels = lock.partitioned_levels();
         }
 
         match level_zero.get(key)? {
             Some(entry) => Ok(Some(entry)),
             None => {
-                for level in &higher_levels {
+                for level in &partitioned_levels {
                     match level.get(key)? {
                         Some(entry) => {
                             return Ok(Some(entry));
@@ -129,10 +140,12 @@ impl Segment {
             .open(&path)?;
         // TODO: read index from file or use mmap
         let index = SegmentIndex {};
+        let metadata = rfile.metadata()?;
         Ok(Segment {
             file: rfile,
             highest_sequence_no: highest_sequence_no,
             index: index,
+            size: metadata.size(),
         })
     }
 
@@ -183,6 +196,10 @@ impl Segment {
         }
 
         Ok(SsTableEntry::from_bytes(&entry_buf))
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
     }
 }
 
@@ -246,18 +263,49 @@ impl SsTableEntry {
     }
 }
 
-impl LevelSearch for OverlappingLevel {
+impl Level for OverlappingLevel {
     fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>> {
         Ok(None)
     }
+    fn segments_to_merge(&self) -> Vec<Arc<Segment>> {
+        self.segments.clone()
+    }
+
+    fn exceeds_target_size(&self) -> bool {
+        let size: u64 = self.segments.iter().map(|segment| segment.size()).sum();
+        size > self.target_size
+    }
+
+    fn merge(
+        &self,
+        segments: &Vec<Arc<Segment>>,
+    ) -> io::Result<(Arc<SsTableLevel<PartitionedLevel>>, Vec<Arc<Segment>>)> {
+        todo!()
+    }
 }
 
-impl LevelSearch for PartitionedLevel {
+impl Level for PartitionedLevel {
     fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>> {
         self.find_containing_segment(key)
             .map(|segment| segment.get(key))
             .transpose()
             .map(|inner_opt| inner_opt.flatten())
+    }
+
+    fn segments_to_merge(&self) -> Vec<Arc<Segment>> {
+        self.segments.clone()
+    }
+
+    fn exceeds_target_size(&self) -> bool {
+        let size: u64 = self.segments.iter().map(|segment| segment.size()).sum();
+        size > self.target_size
+    }
+
+    fn merge(
+        &self,
+        segments: &Vec<Arc<Segment>>,
+    ) -> io::Result<(Arc<SsTableLevel<PartitionedLevel>>, Vec<Arc<Segment>>)> {
+        todo!()
     }
 }
 
@@ -273,9 +321,132 @@ impl PartitionedLevel {
 
 impl<T> SsTableLevel<T>
 where
-    T: LevelSearch,
+    T: Level,
 {
     pub fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>> {
         self.inner.get(key)
+    }
+
+    pub fn from(level_type: T) -> Self {
+        SsTableLevel { inner: level_type }
+    }
+
+    fn segments_to_merge(&self) -> Vec<Arc<Segment>> {
+        self.inner.segments_to_merge()
+    }
+
+    fn exceeds_target_size(&self) -> bool {
+        self.inner.exceeds_target_size()
+    }
+
+    fn merge(
+        &self,
+        segments: &Vec<Arc<Segment>>,
+    ) -> io::Result<(Arc<SsTableLevel<PartitionedLevel>>, Vec<Arc<Segment>>)> {
+        self.inner.merge(segments)
+    }
+}
+
+impl SsTableLevel<PartitionedLevel> {
+    fn new(target_size: u64) -> Self {
+        SsTableLevel {
+            inner: PartitionedLevel {
+                segments: Vec::new(),
+                target_size: target_size,
+            },
+        }
+    }
+}
+
+impl SsTableLevel<OverlappingLevel> {
+    fn new(target_size: u64) -> Self {
+        SsTableLevel {
+            inner: OverlappingLevel {
+                segments: Vec::new(),
+                target_size: target_size,
+            },
+        }
+    }
+}
+
+impl CompactionBt {
+    fn compact_from_level_zero(&mut self) -> io::Result<Vec<Arc<SsTableLevel<PartitionedLevel>>>> {
+        let level_zero: Arc<SsTableLevel<OverlappingLevel>>;
+        let mut partitioned_levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>;
+        {
+            let lock = self.container.read().unwrap();
+            level_zero = lock.level_zero();
+            partitioned_levels = lock.partitioned_levels();
+        }
+
+        let mut new_partitioned_levels = Vec::new();
+        let mut new_partitioned_level: Arc<SsTableLevel<PartitionedLevel>>;
+        let mut segments_to_merge = level_zero.segments_to_merge();
+        let mut segments_to_delete: Vec<Arc<Segment>>;
+        loop {
+            match partitioned_levels.first() {
+                Some(level) => {
+                    // maybe do a match here to clean up if error?
+                    (new_partitioned_level, segments_to_delete) =
+                        level.merge(&segments_to_merge)?;
+                    self.segments_to_delete.append(&mut segments_to_delete);
+                    new_partitioned_levels.push(new_partitioned_level.clone());
+                    let _ = partitioned_levels.remove(0); // TODO: maybe VecDeque is better for this purpose
+                }
+                None => {
+                    let level = Arc::new(SsTableLevel::<PartitionedLevel>::new(0));
+                    // maybe do a match here to clean up if error?
+                    (new_partitioned_level, segments_to_delete) =
+                        level.merge(&segments_to_merge)?;
+                    self.segments_to_delete.append(&mut segments_to_delete);
+                    new_partitioned_levels.push(new_partitioned_level.clone());
+                }
+            }
+            if !new_partitioned_level.exceeds_target_size() {
+                break;
+            }
+            segments_to_merge = new_partitioned_level.segments_to_merge();
+        }
+        new_partitioned_levels.append(&mut partitioned_levels);
+        Ok(new_partitioned_levels)
+    }
+
+    fn compact_from_partitioned_level(
+        &mut self,
+        mut levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>,
+    ) -> io::Result<Vec<Arc<SsTableLevel<PartitionedLevel>>>> {
+        if levels.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut segments_to_merge = levels.first().unwrap().segments_to_merge();
+        let mut new_partitioned_levels = Vec::new();
+        let mut new_partitioned_level: Arc<SsTableLevel<PartitionedLevel>>;
+        let mut segments_to_delete: Vec<Arc<Segment>>;
+        loop {
+            match levels.first() {
+                Some(level) => {
+                    // maybe do a match here to clean up if error?
+                    (new_partitioned_level, segments_to_delete) =
+                        level.merge(&segments_to_merge)?;
+                    self.segments_to_delete.append(&mut segments_to_delete);
+                    new_partitioned_levels.push(new_partitioned_level.clone());
+                    let _ = levels.remove(0); // TODO: maybe VecDeque is better for this purpose
+                }
+                None => {
+                    let level = Arc::new(SsTableLevel::<PartitionedLevel>::new(0));
+                    // maybe do a match here to clean up if error?
+                    (new_partitioned_level, segments_to_delete) =
+                        level.merge(&segments_to_merge)?;
+                    self.segments_to_delete.append(&mut segments_to_delete);
+                    new_partitioned_levels.push(new_partitioned_level.clone());
+                }
+            }
+            if !new_partitioned_level.exceeds_target_size() {
+                break;
+            }
+            segments_to_merge = new_partitioned_level.segments_to_merge();
+        }
+        new_partitioned_levels.append(&mut levels);
+        Ok(new_partitioned_levels)
     }
 }
