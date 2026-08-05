@@ -10,7 +10,7 @@ The API supports 3 operations:
 ## Current status and future development
 - As of now the TCP layer is implemented with an async event loop using tokio (single request per socket/connection) and a custom protocol. The protocol is well tested, the async event loop has some tests using Tokio's mocking functionality and fakes for the storage engine.
     - Future work will at least consist of expanding test coverage. We might also consider reusing connections, i.e. multiple requests per connection.
-- The storage engine consists of a multithreaded hash map (memtable) and we have started implementing a write-ahead-log (WAL). We are planning the following steps:
-    - Finishing the WAL
-    - Implementing the string-sorted table including compaction
+- The storage engine consists of a multithreaded hash map (memtable) and we have implemented a write-ahead-log (WAL) for crash recovery. This is almost fully tested. We are planning the following steps:
+    - Finishing testing of crash recovery, in particular cases where the WAL is corrupted.
+    - Implementing the string-sorted table including compaction.
     - Optimizing the data structures of the memtable for storage of (timestamped) hash trees.
