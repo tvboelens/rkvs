@@ -9,15 +9,23 @@ This consists of 3 parts.
 - When calling `get()` the MemTable is searched first and only is the key is not found the search continues in the SSTables.
 - If the MemTable is full then it gets compacted to an SSTable and the MemTable is cleared again.
 - We need a special value for deleted keys (i.e. a tombstone record). One possibility is to let the MemTable consists of a HashMap with string keys and `Option<String>` values and `None` signifies a deleted key
+    - We might also want to store the LSN with the value, since we also want to persist it to the SSTable
 #### Compaction
 - If size is exceeded
-- Once compaction is finished, rollover WAL and clear the old WAL files
+- Once compaction is finished clear the old WAL files, i.e. all segment files before the active segment
 - Compaction creates a new segment in L0, the caller of `Memtable::compact()` (probably the storage engine) is responsible for adding it to L0 of the LSM tree
 ### Recovery
 - Get latest LSN from SSTable
 - Then go through WAL to recover, just start from the LSN in the SSTable and apply each operation to MemTable
-
-
+- So in more detail
+    - Check if SSTable files exist (separate function)
+        - Yes -> get largest LSN
+        - No -> largest LSN = 0
+    - Check if WAL files exist
+        - No -> new memtable, no recovery
+        - Yes -> check if segments exist containing newer LSNs
+            - No -> new memtable, no recovery
+            - Yes -> recover
 
 ### WAL
 Append-only log that contains all the write operations in order. Rotate after flush of MemTable. 
@@ -27,10 +35,10 @@ write operations on the MemTable in order.
 - LSN (u64) of each entry is byte offset from start
 - Logical log is 4 GB (= 2^32 bytes), so log number is high part (first 32 bits) of LSN
 - One file per segment
-- Filename constists of 3 32 bit unsigned ints
+- Filename constists of 3 32 bit unsigned ints -> hex string of length 24 (1 byte is two hex chars)
     - Timeline (no multi-version support, so this will be 0 always)
     - Logical log number
-    - Segment number -> each logical log divided in n segments, so 0,...,n-1
+    - Segment number -> each logical log divided in n segments, so 0,...,n-1 -> this equals LSN / segment_size 
 - WAL should have exact size (if full) and this should be power of 2 bytes (since it must divide 2^32)
 - We allow WAL entries to be broken up
     - But not the headers?
@@ -49,35 +57,43 @@ Which fields should be in the entry?
 - pageId? -> Have to check what the differences between SQL and KV-stores are with respect to pages
 - before/after?
 
-### Threading
-- WAL is single threaded, access only through the write worker of the storage engine
-- So usually I would say that each thread could access the storage engine
-- So the server would have an event loop
-    - Read tcp request and then spawn a task that handles the request and sends the response
-
 
 ### SSTable/LSM-tree
 1. This is the on-disk layer
-2. Keys are sorted (maybe with an index)
-3. SSTable itself consists of segments (one file per segment)
-4. Memtable full -> new segment
-5. In intervals do compaction
-    1. create new segment that is merged from older segments -> for each key take the newest value
-    2. delete the old segments
-5. Levels -> different approaches
-    1. L0 always has overlapping segments and here searching has to start in the newest and go to oldest (could theoretically also split segments across ranges)
-    2. Then the question becomes if we want to have more levels than L1. These have non-overlapping segments.
-        1. If only L1, merging can become complicated, since we have to merge L0 into L1.
-        2. With multiple levels you can just "push up" and in later compaction remove keys that are in segments in higher levels. Only for moving L0 to L1 one needs to merge everything all at once because of the overlapping segments.
-6. Compaction in case of multiple levels
-    1. Merging L0 to L1 is the usual merge sort
-    2. In higher levels, say level `i` need to check if key is in level `j` for `j<i`. If yes, then do not include in result.
-        1. Just using L1 is not enough
-            1. No, because we might miss L1 being pushed up to L2
-            2. To prevent this we would have to compact every level before compacting L0 into L1, which would probably lead to bad performance
-        2. So a method for compacting that takes the following arguments
-            1. The level to be compacted
-            2. The levels to check for presence of keys
+2. Keys are sorted
+3. SSTable itself consists of levels, which consist of segments (one file per segment)
+4. Memtable full -> flush to new segment
+    1. Currently unclear how I want to do this
+    2. Also need to add the new segment to level 0.
+5. If after MemTable flush level 0 is full, compact
+    1. Need some way to notify the compaction background task of this
+5. Levels
+    1. Level 0 has overlapping segments
+    2. Higher levels (PartitionedLevel) have non-overlapping segments
+    3. Have target/max size, next level has about 10x target size
+6. Compaction
+    1. Determine which segments to merge into higher level
+        1. L0 -> all segments
+        2. higher levels -> From oldest to newest segment, keep going until target size not exceeded
+    2. Merge
+        1. If merging level i-1 into i. Check which segments of level i overlap with those of i-1 we want to merge
+        2. Then form intervals and merge per interval
+    3. Check if the level we merged into exceeds target size, if yes repeat
+    4. Can periodically check if a higher level exceeds target size (e.g. in case a previous compaction failed)
+7. structs and thread safety
+    1. SsTable is the orchestrator
+    2. CompactionBt is the compaction background task
+    3. Segment is a segment of a level
+    4. SsTableLevel represents a level of the SSTable -> Use a generic and trait to distinguish between a level containing overlapping and a level containing non-overlapping segments
+    5. LevelContainer: this is the struct that guarantees thread safety, it contains the following
+        1. An Arc pointing to an OverlappingLevel
+        2. A Vec of Arcs pointing to a PartitionedLevel
+    6. Thread safety
+        1. LevelContainer is behind a RwLock
+        2. Reading threads access the container, and clone the list, then read from the levels
+        3. The compaction background task first clones the list, creates the new segments and a new list and then performs a swap.
+        4. In this way the reading threads see a snapshot
+        5. After completing compaction bt schedules the old segments for deletion and periodically checks the reference count to see whether no reading thread is accessing the segment and it can delete the file
 6. Lookup
     1. Look in newest segment and keep going back until you find it
     2. If not found in level i, go to level i+1.
@@ -100,49 +116,6 @@ Which fields should be in the entry?
     7. How does searching work?
         1. Do binary search, but for this load the index into memory
         2. So find closest index and next index and search this range, if key not found move on the previous segment
-8. So should have the following structs:
-    1. SegmentIndex
-        1. No need for the file, just load the index into memory
-        2. Can probably use a simple hashmap internally, i.e. map key (string) to offset (u64)
-    2. Segment
-        1. file descriptor
-        2. Index
-        3. What should the filename be?
-            1. `*.sst` but what should `*` be?
-            2. probably some kind of epoch + segment number, i.e. after compaction epoch increases by one
-        4. There is also the possibility to split up the data block in smaller blocks which can be loaded into memory as a sort of cache
-    3. SSTable
-        1. Holds the list of segments
-            1. As levels and each level is a Vec
-            2. Maybe L1 separately and the other levels in a Vec (lowest level first)
-        2. Searching
-            1. Only if key not found in memtable
-            2. L1 is special, but apart from that start at L1 and continue until Ln and if not found return None
-            3. In L1 there is overlap, so here we would have to search all segments, but in the other levels we know which segment should contain the key (if it is there) provided we implement this well.
-        3. Compaction
-            1. Create new file and list (one entry or multiple, depends on if we can create one segment file or need to split)
-            2. Delete old files
-            3. swap lists (before deleting?)
-            4. Implementation
-                1. Level 1 has overlapping segments 
-                2. Compact -> L2 no overlapping segments
-                3. But what if L2 already has segments?
-                    1. One possibility -> push L2 up to L3 and compact again (at a later stage maybe)
-                        1. so this would mean looking in the lower levels if a key is present and if yes drop it from this level
-                        2. Maybe only L1? we should not trust the memtable, but we assume that level i does not contain any keys contained in level j for j=2,...,i-1, then if we remove all keys that are contained in L1
-                        3. Best approach seems from bottom to top
-                            1. Merge sort L1 to create new L2.
-                            2. Then from old L2 to Ln do:
-                                1. Write new LiSj until it is full, if so create LiSj+1.
-                                2. When writing only include key if it is not in L1 (i.e. in new L2)
-                    2. Other possibility is to have only 3 levels, L0 is memtable, L1 are the overlapping segments and L2 the non-overlapping
-                        1. First merge L1 and then merge again with L2?
-                        2. I think I like this aproach less, since we have to do two merges
-        4. If memtable flushes, needs to be notified
-        5. Regardless of everything: Implement the merge and specify policy independently
-            1. ⁠First implement merge, which takes a list of segments to merge. We need to know which level the segments have and which ones are more recent
-            2. ⁠⁠or one method for merging with overlapping and one method for non overlapping. In the latter case the key ranges can be used instead of recency. 
-            3. ⁠⁠So then the policy becomes deciding which segments to merge and when.
 
 ### TCP Layer
 - io::Error means that either connection error or unexpected EOF
