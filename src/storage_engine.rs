@@ -8,6 +8,7 @@ use tokio::sync::oneshot::{Sender, channel};
 use sstable::SsTable;
 
 mod memtable;
+mod memtable_flusher;
 mod sstable;
 pub trait Store {
     fn get(

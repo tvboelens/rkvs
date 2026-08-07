@@ -15,7 +15,7 @@ mod wal;
 #[derive(Clone)]
 pub struct MemTableValue {
     pub value: Option<String>,
-    sequence_number: u64,
+    pub sequence_number: u64,
 }
 
 enum WriteJob {

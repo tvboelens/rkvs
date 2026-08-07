@@ -1,13 +1,15 @@
-use std::fs::{File, OpenOptions};
+use std::fs::{File, OpenOptions, remove_file};
 use std::io::{self, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::{Arc, Condvar};
+use std::sync::{Mutex, RwLock};
+use std::time::Duration;
 
 struct SegmentIndex {}
 struct Segment {
     file: File,
+    filepath: PathBuf,
     index: SegmentIndex,
     highest_sequence_no: u64,
     size: u64,
@@ -23,6 +25,7 @@ trait Level {
     fn exceeds_target_size(&self) -> bool;
 }
 
+#[derive(Clone)]
 struct OverlappingLevel {
     segments: Vec<Arc<Segment>>,
     target_size: u64,
@@ -48,6 +51,8 @@ pub struct SsTableEntry {
 struct CompactionBt {
     container: Arc<RwLock<LevelContainer>>,
     segments_to_delete: Vec<Arc<Segment>>,
+    cv: Arc<Condvar>,
+    do_compact: Arc<Mutex<bool>>,
 }
 
 struct LevelContainer {
@@ -57,6 +62,8 @@ struct LevelContainer {
 
 pub struct SsTable {
     inner: Arc<RwLock<LevelContainer>>,
+    compaction_bt_cv: Arc<Condvar>,
+    do_compact: Arc<Mutex<bool>>,
 }
 
 impl LevelContainer {
@@ -82,6 +89,18 @@ impl LevelContainer {
         let target_size = self.level_zero.inner.target_size;
         self.level_zero = Arc::new(SsTableLevel::<OverlappingLevel>::new(target_size));
         self.partitioned_levels = new_partitioned_levels;
+    }
+
+    fn add_to_level_zero(&mut self, path: PathBuf) -> io::Result<()> {
+        let segment = Segment::from_file(path)?;
+        let mut new_level_zero = self.level_zero.as_ref().clone();
+        new_level_zero.add_segment(segment);
+        self.level_zero = Arc::new(new_level_zero);
+        Ok(())
+    }
+
+    fn do_compact(&self) -> bool {
+        self.level_zero.exceeds_target_size()
     }
 }
 
@@ -116,10 +135,25 @@ impl SsTable {
             }
         }
     }
+
+    pub fn find_and_add_segment(&self, path: PathBuf) -> io::Result<()> {
+        let do_compact: bool;
+        {
+            let mut lock = self.inner.write().unwrap();
+            lock.add_to_level_zero(path)?;
+            do_compact = lock.do_compact();
+        }
+        {
+            let mut lock = self.do_compact.lock().unwrap();
+            *lock = do_compact;
+            self.compaction_bt_cv.notify_one();
+        }
+        Ok(())
+    }
 }
 
 impl Segment {
-    pub fn create(path: PathBuf, mut entries: Vec<SsTableEntry>) -> io::Result<Self> {
+    fn create(path: PathBuf, mut entries: Vec<SsTableEntry>) -> io::Result<Self> {
         let mut highest_sequence_no: u64 = 0;
         entries.sort_unstable_by(|entry1, entry2| entry1.key.cmp(&entry2.key));
         let mut wfile = OpenOptions::new()
@@ -143,13 +177,18 @@ impl Segment {
         let metadata = rfile.metadata()?;
         Ok(Segment {
             file: rfile,
+            filepath: path,
             highest_sequence_no: highest_sequence_no,
             index: index,
             size: metadata.size(),
         })
     }
 
-    pub fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>> {
+    fn from_file(path: PathBuf) -> io::Result<Self> {
+        todo!()
+    }
+
+    fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>> {
         /*
         This might be suboptimal. Maybe we can extract the offset of the next key as well,
         read the byte stream into memory and traverse that instead of the file.
@@ -367,6 +406,17 @@ impl SsTableLevel<OverlappingLevel> {
             },
         }
     }
+
+    fn add_segment(&mut self, segment: Segment) -> () {
+        self.inner.segments.push(Arc::new(segment));
+    }
+}
+
+impl Clone for SsTableLevel<OverlappingLevel> {
+    fn clone(&self) -> Self {
+        let inner = self.inner.clone();
+        SsTableLevel { inner: inner }
+    }
 }
 
 impl CompactionBt {
@@ -448,5 +498,95 @@ impl CompactionBt {
         }
         new_partitioned_levels.append(&mut levels);
         Ok(new_partitioned_levels)
+    }
+
+    fn find_partitioned_levels_to_compact(
+        &self,
+    ) -> (
+        Vec<Arc<SsTableLevel<PartitionedLevel>>>,
+        Vec<Arc<SsTableLevel<PartitionedLevel>>>,
+    ) {
+        let partitioned_levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>;
+        {
+            let lock = self.container.read().unwrap();
+            partitioned_levels = lock.partitioned_levels();
+        }
+        let mut idx: usize = 0;
+        for _ in 0..partitioned_levels.len() {
+            if partitioned_levels[idx].exceeds_target_size() {
+                break;
+            }
+            idx += 1;
+        }
+        if idx == partitioned_levels.len() {
+            return (partitioned_levels, Vec::new());
+        } else {
+            return (
+                partitioned_levels[0..idx].to_vec(),
+                partitioned_levels[idx..].to_vec(),
+            );
+        }
+    }
+
+    fn remove_segment_files(&mut self) {
+        let mut indices = Vec::new();
+        let mut files = Vec::new();
+        for i in 0..self.segments_to_delete.len() {
+            /* Since we swapped the segments the reference count can only go down,
+            hence it is safe to delete as soon as reference count is 1 */
+            if Arc::strong_count(&self.segments_to_delete[i]) == 1 {
+                indices.push(i);
+                files.push(self.segments_to_delete[i].filepath.clone());
+            }
+        }
+        indices.reverse();
+        for idx in indices {
+            self.segments_to_delete.remove(idx);
+        }
+        for file in files {
+            /* No need to handle error, since this can only fail if
+            path does not exist, is a dir or we do not have permissions
+            and this should never happen */
+            let _ = remove_file(file);
+        }
+    }
+
+    fn run(&mut self) {
+        let mut do_compact: bool;
+        loop {
+            {
+                let lock = self.do_compact.lock().unwrap();
+                let res = self
+                    .cv
+                    .wait_timeout(lock, Duration::from_millis(5000))
+                    .unwrap();
+                do_compact = *res.0;
+            }
+
+            if do_compact {
+                match self.compact_from_level_zero() {
+                    Ok(new_levels) => {
+                        {
+                            let mut container = self.container.write().unwrap();
+                            container.swap_all_levels(new_levels);
+                        }
+                        self.remove_segment_files();
+                    }
+                    Err(_) => {
+                        break;
+                    } // TODO: log instead of break
+                }
+            } else {
+                self.remove_segment_files();
+                let (mut new_partitioned_levels, levels_to_compact) =
+                    self.find_partitioned_levels_to_compact();
+                let mut new_levels = self
+                    .compact_from_partitioned_level(levels_to_compact)
+                    .unwrap();
+                new_partitioned_levels.append(&mut new_levels);
+                let mut container = self.container.write().unwrap();
+                container.swap_partitioned_levels(new_partitioned_levels);
+            }
+        }
     }
 }
