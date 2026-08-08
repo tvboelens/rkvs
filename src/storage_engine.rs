@@ -5,6 +5,7 @@ use std::sync::mpsc::SendError;
 use std::sync::{Arc, Mutex, mpsc};
 use tokio::sync::oneshot::{Sender, channel};
 
+use memtable_flusher::Flusher;
 use sstable::SsTable;
 
 mod memtable;
@@ -53,6 +54,7 @@ pub struct StorageEngineConf {
     //timeout: Duration,
     dir: PathBuf,
     segment_size: u32,
+    memtable_max_size: u64,
 }
 
 #[derive(Debug)]
@@ -105,17 +107,21 @@ impl Store for StorageEngine {
 
 impl StorageEngine {
     pub fn new(config: StorageEngineConf) -> io::Result<Self> {
+        let sstable = SsTable::start()?; // TODO: sstable also needs to know about the dir
+        let sstable_ptr = Arc::new(sstable);
+        let flusher = Arc::new(Flusher::from(sstable_ptr.clone(), config.dir.clone()));
         let memtable = memtable::MemTable::start(
-            config.dir.join(PathBuf::from("WAL")),
+            config.dir,
             config.segment_size,
             0,
+            config.memtable_max_size,
+            flusher,
         )?;
         let (tx, rx) = mpsc::channel();
         let receiver = Arc::new(Mutex::new(rx));
-        let sstable = SsTable::start()?;
         let worker = Worker {
             memtable: Arc::new(memtable),
-            sstable: Arc::new(sstable),
+            sstable: sstable_ptr,
             receiver: receiver,
         };
         let mut join_handles = Vec::new();

@@ -1,5 +1,6 @@
 use std::fs::{self, File, OpenOptions, read_dir};
 use std::io::ErrorKind;
+use std::marker::Sync;
 use std::path::PathBuf;
 use std::sync::{
     Arc, RwLock,
@@ -9,6 +10,9 @@ use std::thread::JoinHandle;
 use std::{collections::HashMap, io};
 use wal::segment::{OpType, RecoveryError, Segment, final_entry_after};
 use wal::{Wal, segment::WalEntry};
+
+use crate::storage_engine::memtable_flusher::MemTableFlush;
+use crate::storage_engine::sstable::SsTableEntry;
 
 mod wal;
 
@@ -30,14 +34,26 @@ pub struct MemTable {
     writer_handle: JoinHandle<()>,
 }
 
-struct WriteWorker {
+struct WriteWorker<T>
+where
+    T: MemTableFlush + Send + Sync + ?Sized + 'static,
+{
     table: Arc<RwLock<HashMap<String, MemTableValue>>>,
     receiver: Receiver<WriteJob>,
     wal: wal::Wal,
+    flusher: Arc<T>,
+    current_size: u64,
+    max_size: u64,
 }
 
 impl MemTable {
-    pub fn start(dir: PathBuf, segment_size: u32, sequence_number: u64) -> io::Result<Self> {
+    pub fn start<T: MemTableFlush + Send + Sync + ?Sized + 'static>(
+        dir: PathBuf,
+        segment_size: u32,
+        sequence_number: u64,
+        max_size: u64,
+        flusher: Arc<T>,
+    ) -> io::Result<Self> {
         let segments = MemTable::find_and_open_segments(&dir, &segment_size, &sequence_number)?;
         if !segments.is_empty() {
             let mut table = HashMap::new();
@@ -46,12 +62,12 @@ impl MemTable {
                 (sequence_number % segment_size as u64).try_into().unwrap(),
                 &mut table,
             ) {
-                Ok(_) => {
+                Ok(curr_size) => {
                     let segment = MemTable::open_last_segment(&dir, &segment_size)?;
-                    let wal = Wal::from_segment(dir, segment, segment_size);
-                    return Ok(MemTable::from(table, wal));
+                    let wal = Wal::from_segment(dir.join("WAL"), segment, segment_size);
+                    return Ok(MemTable::from(table, wal, flusher, curr_size, max_size));
                 }
-                Err(e) => match e {
+                Err((curr_size, e)) => match e {
                     // TODO: this needs to be logged
                     RecoveryError::Corrupted(fp, offset) => {
                         let segment =
@@ -60,8 +76,8 @@ impl MemTable {
                         for fp in file_paths {
                             fs::remove_file(fp)?;
                         }
-                        let wal = Wal::from_segment(dir, segment, segment_size);
-                        return Ok(MemTable::from(table, wal));
+                        let wal = Wal::from_segment(dir.join("WAL"), segment, segment_size);
+                        return Ok(MemTable::from(table, wal, flusher, curr_size, max_size));
                     }
                     RecoveryError::Io(err) => {
                         return Err(err);
@@ -70,17 +86,26 @@ impl MemTable {
             }
         } else {
             let wal = Wal::create_new(dir, segment_size)?;
-            Ok(MemTable::from(HashMap::new(), wal))
+            Ok(MemTable::from(HashMap::new(), wal, flusher, 0, max_size))
         }
     }
 
-    fn from(table: HashMap<String, MemTableValue>, wal: Wal) -> Self {
+    fn from<T: MemTableFlush + Send + Sync + ?Sized + 'static>(
+        table: HashMap<String, MemTableValue>,
+        wal: Wal,
+        flusher: Arc<T>,
+        curr_size: u64,
+        max_size: u64,
+    ) -> Self {
         let table_ptr = Arc::new(RwLock::new(table));
         let (tx, rx) = channel();
         let mut worker = WriteWorker {
             receiver: rx,
             table: table_ptr.clone(),
             wal: wal,
+            flusher: flusher,
+            current_size: curr_size,
+            max_size: max_size,
         };
         // TODO: implement run and start thread that calls it
         let handle = std::thread::spawn(move || worker.run());
@@ -225,7 +250,8 @@ impl MemTable {
         segments: Vec<Segment>,
         starting_offset: u32,
         table: &mut HashMap<String, MemTableValue>,
-    ) -> Result<(), RecoveryError> {
+    ) -> Result<u64, (u64, RecoveryError)> {
+        let mut curr_size: u64 = 0;
         let mut offset = starting_offset;
         let mut partial_entry: Option<Vec<u8>> = None;
         for mut segment in segments {
@@ -240,6 +266,8 @@ impl MemTable {
                                     sequence_number: entry.sequence_number,
                                     value: entry.value,
                                 };
+                                curr_size += SsTableEntry::from(entry.key.clone(), value.clone())
+                                    .len() as u64;
                                 _ = table.insert(entry.key, value);
                             }
                             OpType::Put => {
@@ -247,6 +275,8 @@ impl MemTable {
                                     sequence_number: entry.sequence_number,
                                     value: entry.value,
                                 };
+                                curr_size += SsTableEntry::from(entry.key.clone(), value.clone())
+                                    .len() as u64;
                                 _ = table.insert(entry.key, value);
                             }
                         }
@@ -255,7 +285,7 @@ impl MemTable {
                     match res {
                         Ok(opt) => partial_entry = opt,
                         Err(e) => {
-                            return Err(e);
+                            return Err((curr_size, e));
                         }
                     }
                 }
@@ -268,6 +298,8 @@ impl MemTable {
                                     sequence_number: entry.sequence_number,
                                     value: entry.value,
                                 };
+                                curr_size += SsTableEntry::from(entry.key.clone(), value.clone())
+                                    .len() as u64;
                                 _ = table.insert(entry.key, value);
                             }
                             OpType::Put => {
@@ -275,6 +307,8 @@ impl MemTable {
                                     sequence_number: entry.sequence_number,
                                     value: entry.value,
                                 };
+                                curr_size += SsTableEntry::from(entry.key.clone(), value.clone())
+                                    .len() as u64;
                                 _ = table.insert(entry.key, value);
                             }
                         }
@@ -282,17 +316,20 @@ impl MemTable {
                     match res {
                         Ok(opt) => partial_entry = opt,
                         Err(e) => {
-                            return Err(e);
+                            return Err((curr_size, e));
                         }
                     }
                 }
             }
         }
-        Ok(())
+        Ok(curr_size)
     }
 }
 
-impl WriteWorker {
+impl<T> WriteWorker<T>
+where
+    T: MemTableFlush + Send + Sync + ?Sized,
+{
     fn put(&mut self, key: String, value: String) -> io::Result<Option<MemTableValue>> {
         let sequence_number = self.wal.next_sequence_number();
         let entry = WalEntry {
@@ -306,7 +343,10 @@ impl WriteWorker {
             value: Some(value),
             sequence_number: sequence_number,
         };
-        Ok(self.table.write().unwrap().insert(key, mvalue)) // TODO: handle locking error
+        let len = SsTableEntry::from(entry.key.clone(), mvalue.clone()).len() as u64;
+        let val = self.table.write().unwrap().insert(key, mvalue);
+        self.current_size += len;
+        Ok(val) // TODO: handle locking error
     }
 
     fn delete(&mut self, key: &String) -> io::Result<Option<MemTableValue>> {
@@ -322,11 +362,26 @@ impl WriteWorker {
             sequence_number: sequence_number,
             value: None,
         };
-        Ok(self.table.write().unwrap().insert(key.clone(), mvalue))
+        let len = SsTableEntry::from(entry.key.clone(), mvalue.clone()).len() as u64;
+        let val = self.table.write().unwrap().insert(key.clone(), mvalue);
+        self.current_size += len;
+        Ok(val)
     }
 
     fn run(&mut self) {
         while let Ok(job) = self.receiver.recv() {
+            if self.current_size >= self.max_size {
+                let mut lock = self.table.write().unwrap();
+                match self.flusher.flush(&*lock) {
+                    Ok(_) => {
+                        self.current_size = 0;
+                        lock.clear();
+                    }
+                    Err(_) => {
+                        todo!() // TODO: log error
+                    }
+                }
+            }
             match job {
                 WriteJob::Delete(key, sender) => {
                     let _ = sender.send(self.delete(&key));
@@ -342,6 +397,7 @@ impl WriteWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage_engine::memtable_flusher::MemTableFlush;
     use std::fs::DirBuilder;
     use std::path::PathBuf;
 
@@ -362,13 +418,22 @@ mod tests {
         }
     }
 
+    struct FakeFlusher {}
+
+    impl MemTableFlush for FakeFlusher {
+        fn flush(&self, _: &HashMap<String, MemTableValue>) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn basic_put_get() {
         let dir = PathBuf::from("./memtable_basic_put_get");
         let cl = Cleanup { dir: dir.clone() };
         let segment_size = 256;
         assert!(cl.setup().is_ok());
-        let memtable = MemTable::start(dir, segment_size, 0).unwrap();
+        let memtable =
+            MemTable::start(dir, segment_size, 0, 2u64.pow(32), Arc::new(FakeFlusher {})).unwrap();
         let res = memtable.put(String::from("key"), String::from("value"));
         assert!(matches!(res, Ok(None)));
         let v = memtable.get(&String::from("key")).unwrap();
@@ -381,7 +446,8 @@ mod tests {
         let cl = Cleanup { dir: dir.clone() };
         let segment_size = 256;
         assert!(cl.setup().is_ok());
-        let memtable = MemTable::start(dir, segment_size, 0).unwrap();
+        let memtable =
+            MemTable::start(dir, segment_size, 0, 2u64.pow(32), Arc::new(FakeFlusher {})).unwrap();
         let res = memtable.put(String::from("key"), String::from("value1"));
         assert!(matches!(res, Ok(None)));
         let old_value = memtable.put(String::from("key"), String::from("value2"));
@@ -399,7 +465,8 @@ mod tests {
         let cl = Cleanup { dir: dir.clone() };
         let segment_size = 256;
         assert!(cl.setup().is_ok());
-        let memtable = MemTable::start(dir, segment_size, 0).unwrap();
+        let memtable =
+            MemTable::start(dir, segment_size, 0, 2u64.pow(32), Arc::new(FakeFlusher {})).unwrap();
         let _ = memtable.put(String::from(""), String::from("value"));
     }
 
@@ -409,7 +476,8 @@ mod tests {
         let cl = Cleanup { dir: dir.clone() };
         let segment_size = 256;
         assert!(cl.setup().is_ok());
-        let memtable = MemTable::start(dir, segment_size, 0).unwrap();
+        let memtable =
+            MemTable::start(dir, segment_size, 0, 2u64.pow(32), Arc::new(FakeFlusher {})).unwrap();
         let res = memtable.get(&String::from(""));
         assert!(matches!(res, None));
     }
@@ -420,7 +488,8 @@ mod tests {
         let cl = Cleanup { dir: dir.clone() };
         let segment_size = 256;
         assert!(cl.setup().is_ok());
-        let memtable = MemTable::start(dir, segment_size, 0).unwrap();
+        let memtable =
+            MemTable::start(dir, segment_size, 0, 2u64.pow(32), Arc::new(FakeFlusher {})).unwrap();
         let mut res = memtable.delete(&String::from("key"));
         assert!(matches!(res, Ok(None)));
         res = memtable.put(String::from("key"), String::from("value"));
@@ -448,7 +517,14 @@ mod tests {
         let segment_size = 4096;
         assert!(cl.setup().is_ok());
         {
-            let memtable = MemTable::start(dir.clone(), segment_size.clone(), 0).unwrap();
+            let memtable = MemTable::start(
+                dir.clone(),
+                segment_size.clone(),
+                0,
+                2u64.pow(32),
+                Arc::new(FakeFlusher {}),
+            )
+            .unwrap();
             let _ = memtable.put(String::from("key1"), String::from("value1"));
             let _ = memtable.put(String::from("key1"), String::from("new_value1"));
             let _ = memtable.put(String::from("key2"), String::from("value2"));
@@ -456,7 +532,14 @@ mod tests {
             let _ = memtable.put(String::from("key3"), String::from("value3"));
         }
 
-        let memtable = MemTable::start(dir, segment_size.clone(), 0).unwrap();
+        let memtable = MemTable::start(
+            dir,
+            segment_size.clone(),
+            0,
+            2u64.pow(32),
+            Arc::new(FakeFlusher {}),
+        )
+        .unwrap();
         let mut res = memtable.get(&String::from("key1")).unwrap();
         assert!(matches!(res.value, Some(v) if v == String::from("new_value1")));
         res = memtable.get(&String::from("key2")).unwrap();
@@ -472,7 +555,14 @@ mod tests {
         let segment_size = 4096;
         assert!(cl.setup().is_ok());
         {
-            let memtable = MemTable::start(dir.clone(), segment_size.clone(), 0).unwrap();
+            let memtable = MemTable::start(
+                dir.clone(),
+                segment_size.clone(),
+                0,
+                2u64.pow(32),
+                Arc::new(FakeFlusher {}),
+            )
+            .unwrap();
             let _ = memtable.put(String::from("key1"), String::from("value1"));
             let _ = memtable.put(String::from("key1"), String::from("new_value1"));
             let _ = memtable.put(String::from("key2"), String::from("value2"));
@@ -486,7 +576,14 @@ mod tests {
         */
 
         {
-            let memtable = MemTable::start(dir.clone(), segment_size.clone(), 0).unwrap();
+            let memtable = MemTable::start(
+                dir.clone(),
+                segment_size.clone(),
+                0,
+                2u64.pow(32),
+                Arc::new(FakeFlusher {}),
+            )
+            .unwrap();
             let mut res = memtable.get(&String::from("key1")).unwrap();
             assert!(matches!(res.value, Some(value) if value == String::from("new_value1")));
             res = memtable.get(&String::from("key2")).unwrap();
@@ -504,7 +601,14 @@ mod tests {
         key4: value4
         */
 
-        let memtable = MemTable::start(dir, segment_size.clone(), 0).unwrap();
+        let memtable = MemTable::start(
+            dir,
+            segment_size.clone(),
+            0,
+            2u64.pow(32),
+            Arc::new(FakeFlusher {}),
+        )
+        .unwrap();
         let mut res = memtable.get(&String::from("key1")).unwrap();
         assert!(matches!(res.value, Some(value) if value == String::from("new_value1")));
         res = memtable.get(&String::from("key2")).unwrap();
@@ -522,7 +626,14 @@ mod tests {
         let segment_size = 64;
         assert!(cl.setup().is_ok());
         {
-            let memtable = MemTable::start(dir.clone(), segment_size.clone(), 0).unwrap();
+            let memtable = MemTable::start(
+                dir.clone(),
+                segment_size.clone(),
+                0,
+                2u64.pow(32),
+                Arc::new(FakeFlusher {}),
+            )
+            .unwrap();
             let _ = memtable.put(String::from("key1"), String::from("value1"));
             let _ = memtable.put(String::from("key1"), String::from("new_value1"));
             let _ = memtable.put(String::from("key2"), String::from("value2"));
@@ -530,7 +641,14 @@ mod tests {
             let _ = memtable.put(String::from("key3"), String::from("value3"));
         }
 
-        let memtable = MemTable::start(dir, segment_size.clone(), 0).unwrap();
+        let memtable = MemTable::start(
+            dir,
+            segment_size.clone(),
+            0,
+            2u64.pow(32),
+            Arc::new(FakeFlusher {}),
+        )
+        .unwrap();
         let mut res = memtable.get(&String::from("key1")).unwrap();
         assert!(matches!(res.value, Some(value) if value == String::from("new_value1")));
         res = memtable.get(&String::from("key2")).unwrap();
@@ -546,7 +664,14 @@ mod tests {
         let segment_size = 4096;
         assert!(cl.setup().is_ok());
         {
-            let memtable = MemTable::start(dir.clone(), segment_size.clone(), 0).unwrap();
+            let memtable = MemTable::start(
+                dir.clone(),
+                segment_size.clone(),
+                0,
+                2u64.pow(32),
+                Arc::new(FakeFlusher {}),
+            )
+            .unwrap();
             let _ = memtable.put(String::from("key1"), String::from("value1"));
             let _ = memtable.put(String::from("key1"), String::from("new_value1"));
             let _ = memtable.put(String::from("key2"), String::from("value2"));
@@ -560,7 +685,14 @@ mod tests {
         */
 
         {
-            let memtable = MemTable::start(dir.clone(), segment_size.clone(), 0).unwrap();
+            let memtable = MemTable::start(
+                dir.clone(),
+                segment_size.clone(),
+                0,
+                2u64.pow(32),
+                Arc::new(FakeFlusher {}),
+            )
+            .unwrap();
             let mut res = memtable.get(&String::from("key1")).unwrap();
             assert!(matches!(res.value, Some(value) if value == String::from("new_value1")));
             res = memtable.get(&String::from("key2")).unwrap();
@@ -578,7 +710,14 @@ mod tests {
         key4: value4
         */
 
-        let memtable = MemTable::start(dir, segment_size.clone(), 0).unwrap();
+        let memtable = MemTable::start(
+            dir,
+            segment_size.clone(),
+            0,
+            2u64.pow(32),
+            Arc::new(FakeFlusher {}),
+        )
+        .unwrap();
         let mut res = memtable.get(&String::from("key1")).unwrap();
         assert!(matches!(res.value, Some(value) if value == String::from("new_value1")));
         res = memtable.get(&String::from("key2")).unwrap();
@@ -597,7 +736,14 @@ mod tests {
         assert!(cl.setup().is_ok());
         let sequence_number: u64;
         {
-            let memtable = MemTable::start(dir.clone(), segment_size.clone(), 0).unwrap();
+            let memtable = MemTable::start(
+                dir.clone(),
+                segment_size.clone(),
+                0,
+                2u64.pow(32),
+                Arc::new(FakeFlusher {}),
+            )
+            .unwrap();
             let _ = memtable.put(String::from("key1"), String::from("value1")); // 0 -> 35
             let _ = memtable.put(String::from("key1"), String::from("new_value1")); //35 -> 74
             let _ = memtable.put(String::from("key2"), String::from("value2")); // 74 -> 109
@@ -607,7 +753,14 @@ mod tests {
             let _ = memtable.put(String::from("key3"), String::from("value3")); // 134 -> 169
         }
 
-        let memtable = MemTable::start(dir, segment_size.clone(), sequence_number).unwrap();
+        let memtable = MemTable::start(
+            dir,
+            segment_size.clone(),
+            sequence_number,
+            2u64.pow(32),
+            Arc::new(FakeFlusher {}),
+        )
+        .unwrap();
         let res = memtable.get(&String::from("key1"));
         assert!(matches!(res, None));
         let res = memtable.get(&String::from("key2")).unwrap();
