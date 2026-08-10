@@ -210,7 +210,7 @@ impl TcpRequest {
         bytes[0..4].copy_from_slice(&header_len.to_be_bytes());
         bytes[4..8].copy_from_slice(&MAGIC_BYTES);
         bytes.append(&mut self.headers.to_bytes().to_vec());
-        let payload_len: u32 = self.payload.len().try_into().unwrap();
+        let payload_len = self.payload.len() as u32;
         bytes.append(&mut payload_len.to_be_bytes().to_vec());
         bytes.append(&mut self.payload.to_bytes().to_vec());
         bytes
@@ -303,7 +303,7 @@ impl Payload {
             Some(value) => buf.resize(key_len + 8 + value.len(), 0),
             None => buf.resize(key_len + 4, 0),
         }
-        let key_len_u32: u32 = key_len.try_into().unwrap();
+        let key_len_u32: u32 = key_len as u32;
         buf[0..4].copy_from_slice(&key_len_u32.to_be_bytes());
         buf[4..key_len + 4].copy_from_slice(self.key.as_bytes());
         let _ = self.value.as_ref().map(|value| {
