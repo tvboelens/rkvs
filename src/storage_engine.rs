@@ -55,6 +55,7 @@ pub struct StorageEngineConf {
     dir: PathBuf,
     segment_size: u32,
     memtable_max_size: u64,
+    sstable_index_sparsity_factor: u32,
 }
 
 #[derive(Debug)]
@@ -109,7 +110,11 @@ impl StorageEngine {
     pub fn new(config: StorageEngineConf) -> io::Result<Self> {
         let sstable = SsTable::start()?; // TODO: sstable also needs to know about the dir
         let sstable_ptr = Arc::new(sstable);
-        let flusher = Flusher::from(sstable_ptr.clone(), config.dir.clone());
+        let flusher = Flusher::from(
+            sstable_ptr.clone(),
+            config.dir.clone(),
+            Arc::new(config.sstable_index_sparsity_factor),
+        );
         let memtable = memtable::MemTable::start(
             config.dir,
             config.segment_size,
