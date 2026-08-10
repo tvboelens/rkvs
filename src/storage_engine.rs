@@ -109,7 +109,7 @@ impl StorageEngine {
     pub fn new(config: StorageEngineConf) -> io::Result<Self> {
         let sstable = SsTable::start()?; // TODO: sstable also needs to know about the dir
         let sstable_ptr = Arc::new(sstable);
-        let flusher = Arc::new(Flusher::from(sstable_ptr.clone(), config.dir.clone()));
+        let flusher = Flusher::from(sstable_ptr.clone(), config.dir.clone());
         let memtable = memtable::MemTable::start(
             config.dir,
             config.segment_size,
