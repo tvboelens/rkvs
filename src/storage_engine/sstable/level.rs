@@ -1,20 +1,24 @@
 use super::SsTableEntry;
+use crate::storage_engine::memtable::MemTableValue;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub static MAGIC_BYTES: [u8; 4] = [0x72, 0x6B, 0x76, 0x73]; //rkvs
+static MAGIC_BYTES: [u8; 4] = [0x72, 0x6B, 0x76, 0x73]; //rkvs
 
 pub struct SegmentIndexEntry {
     key: String,
     offset: u64,
 }
-pub struct SegmentIndex {
+
+struct SegmentIndex {
     indices: Vec<SegmentIndexEntry>,
     len: usize,
 }
+
 pub struct Segment {
     file: File,
     filepath: PathBuf,
@@ -141,7 +145,7 @@ impl Segment {
         })
     }
 
-    fn from_file(path: PathBuf) -> io::Result<Self> {
+    fn from_file(_path: PathBuf) -> io::Result<Self> {
         todo!()
     }
 
@@ -201,11 +205,55 @@ impl Segment {
     pub fn filepath(&self) -> PathBuf {
         self.filepath.clone()
     }
+
+    pub fn write_segment_file(
+        dir: &PathBuf,
+        table: &HashMap<String, MemTableValue>,
+        sequence_number: &u64,
+        index_sparsity_factor: &u32,
+    ) -> io::Result<PathBuf> {
+        let filename = Segment::determine_segment_filename(sequence_number);
+        let filepath = dir.join(filename);
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(filepath.clone())?;
+        let mut writer = BufWriter::new(file);
+        let mut keys: Vec<String> = table.keys().cloned().collect();
+        keys.sort_unstable();
+        let mut index = SegmentIndex::new();
+        let mut counter: u32 = 0;
+        let mut offset: u64 = 0;
+        for key in keys {
+            if counter % index_sparsity_factor == 0 {
+                index.add_index(key.clone(), offset.clone());
+            }
+            let value = table.get(&key).unwrap().clone();
+            let entry = SsTableEntry::from(key, value);
+            writer.write_all(&entry.to_bytes())?;
+            counter += 1;
+            offset += entry.len() as u64;
+        }
+        writer.write_all(&index.to_bytes())?;
+        let footer = SegmentFooter::from(offset);
+        writer.write_all(&footer.to_bytes())?;
+        writer.flush()?;
+        Ok(filepath)
+    }
+
+    fn determine_segment_filename(sequence_number: &u64) -> String {
+        let mut padding_bytes = Vec::<u8>::new();
+        let level_number_str = String::from("00000000");
+        let mut sequence_number_hex_str = format!("{:x}", sequence_number);
+        padding_bytes.resize(8 - sequence_number_hex_str.len(), 48); // "0" = 0x30 = 48
+        sequence_number_hex_str.insert_str(0, &String::from_utf8(padding_bytes).unwrap());
+        level_number_str + &sequence_number_hex_str
+    }
 }
 
 impl Level for OverlappingLevel {
-    fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>> {
-        Ok(None)
+    fn get(&self, _key: &String) -> io::Result<Option<SsTableEntry>> {
+        todo!()
     }
     fn segments_to_merge(&self) -> Vec<Arc<Segment>> {
         self.segments.clone()
@@ -218,7 +266,7 @@ impl Level for OverlappingLevel {
 
     fn merge(
         &self,
-        segments: &Vec<Arc<Segment>>,
+        _segments: &Vec<Arc<Segment>>,
     ) -> io::Result<(Arc<SsTableLevel<PartitionedLevel>>, Vec<Arc<Segment>>)> {
         todo!()
     }
@@ -243,18 +291,18 @@ impl Level for PartitionedLevel {
 
     fn merge(
         &self,
-        segments: &Vec<Arc<Segment>>,
+        _segments: &Vec<Arc<Segment>>,
     ) -> io::Result<(Arc<SsTableLevel<PartitionedLevel>>, Vec<Arc<Segment>>)> {
         todo!()
     }
 }
 
 impl PartitionedLevel {
-    fn find_containing_segment(&self, key: &String) -> Option<Arc<Segment>> {
+    fn find_containing_segment(&self, _key: &String) -> Option<Arc<Segment>> {
         if self.segments.is_empty() {
             None
         } else {
-            Some(self.segments[0].clone())
+            todo!()
         }
     }
 }
@@ -339,18 +387,18 @@ impl SegmentIndex {
         }
     }
     fn find_closest_offset(&self, key: &String) -> u64 {
-        let mut L: usize = 0;
-        let mut R = self.indices.len() - 1;
-        let mut M = (L + R) / 2;
-        while L < R {
-            if self.indices[L].key <= *key {
-                L = M;
+        let mut l: usize = 0;
+        let mut r = self.indices.len() - 1;
+        let mut m = (l + r) / 2;
+        while l < r {
+            if self.indices[l].key <= *key {
+                l = m;
             } else {
-                R = M;
+                r = m;
             }
-            M = (L + R) / 2
+            m = (l + r) / 2
         }
-        self.indices[L].offset
+        self.indices[l].offset
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {

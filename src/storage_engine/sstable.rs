@@ -1,3 +1,4 @@
+use crate::storage_engine::memtable::MemTableValue;
 use level::{LevelContainer, OverlappingLevel, PartitionedLevel, SsTableLevel};
 use std::io;
 use std::path::PathBuf;
@@ -96,12 +97,13 @@ impl SsTableEntry {
         buf
     }
 
-    fn from_bytes(bytes: &Vec<u8>) -> Self {
-        SsTableEntry {
+    fn from_bytes(_bytes: &Vec<u8>) -> Self {
+        todo!()
+        /* SsTableEntry {
             key: String::from("key"),
             value: None,
             sequence_number: 0,
-        }
+        } */
     }
 
     pub fn len(&self) -> usize {
@@ -118,5 +120,13 @@ impl SsTableEntry {
             Some(v) => v.len() + 1,
         };
         3 * size_of::<u32>() + size_of::<u64>() + self.key.len() + value_len
+    }
+
+    pub fn from(key: String, value: MemTableValue) -> Self {
+        SsTableEntry {
+            key: key,
+            value: value.value,
+            sequence_number: value.sequence_number,
+        }
     }
 }
