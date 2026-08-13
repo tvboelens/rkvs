@@ -8,6 +8,7 @@ use std::sync::{Mutex, RwLock};
 mod compaction;
 pub mod level;
 
+#[derive(PartialEq, Debug)]
 pub struct SsTableEntry {
     pub key: String,
     pub value: Option<String>,
@@ -73,9 +74,6 @@ impl SsTableEntry {
         let mut buf = Vec::new();
         let mut offset: usize = 0;
         buf.resize(self.len(), 0);
-        let entry_len = self.len() as u32;
-        buf[offset..offset + size_of::<u32>()].copy_from_slice(&entry_len.to_le_bytes());
-        offset += size_of::<u32>();
         let key_len = self.key.len() as u32;
         buf[offset..offset + size_of::<u32>()].copy_from_slice(&key_len.to_le_bytes());
         offset += size_of::<u32>();
@@ -83,12 +81,18 @@ impl SsTableEntry {
         offset += self.key.len();
         match &self.value {
             Some(value) => {
+                let value_len = value.len() as u32;
+                buf[offset..offset + size_of::<u32>()].copy_from_slice(&value_len.to_le_bytes());
+                offset += size_of::<u32>();
                 buf[offset] = 0;
                 offset += 1;
                 buf[offset..offset + value.len()].copy_from_slice(&value.as_bytes());
                 offset += value.len();
             }
             None => {
+                let value_len: u32 = 0;
+                buf[offset..offset + size_of::<u32>()].copy_from_slice(&value_len.to_le_bytes());
+                offset += size_of::<u32>();
                 buf[offset] = 1;
                 offset += 1;
             }
@@ -97,18 +101,40 @@ impl SsTableEntry {
         buf
     }
 
-    fn from_bytes(_bytes: &Vec<u8>) -> Self {
-        todo!()
-        /* SsTableEntry {
-            key: String::from("key"),
-            value: None,
-            sequence_number: 0,
-        } */
+    fn from_bytes(bytes: &Vec<u8>) -> Self {
+        let mut offset: usize = 0;
+        let mut u32_buf: [u8; size_of::<u32>()] = [0, 0, 0, 0];
+        u32_buf.copy_from_slice(&bytes[offset..offset + size_of::<u32>()]);
+        let key_len = u32::from_le_bytes(u32_buf);
+        offset += size_of::<u32>();
+        let key = String::from_utf8(bytes[offset..offset + key_len as usize].to_vec()).unwrap();
+        offset += key_len as usize;
+        u32_buf.copy_from_slice(&bytes[offset..offset + size_of::<u32>()]);
+        let value_len = u32::from_le_bytes(u32_buf);
+        offset += size_of::<u32>();
+        let tombstone_value = bytes[offset];
+        offset += 1;
+        let value: Option<String>;
+        if tombstone_value == 1 {
+            value = None;
+        } else {
+            value = Some(
+                String::from_utf8(bytes[offset..offset + value_len as usize].to_vec()).unwrap(),
+            );
+        }
+        offset += value_len as usize;
+        let mut u64_buf: [u8; size_of::<u64>()] = [0, 0, 0, 0, 0, 0, 0, 0];
+        u64_buf.copy_from_slice(&bytes[offset..offset + size_of::<u64>()]);
+        let sequence_no = u64::from_le_bytes(u64_buf);
+        SsTableEntry {
+            key: key,
+            value: value,
+            sequence_number: sequence_no,
+        }
     }
 
     pub fn len(&self) -> usize {
         /*
-        entry_len: u32
         key_len: u32
         key: variable len
         value_len: u32
@@ -119,7 +145,7 @@ impl SsTableEntry {
             None => 1,
             Some(v) => v.len() + 1,
         };
-        3 * size_of::<u32>() + size_of::<u64>() + self.key.len() + value_len
+        2 * size_of::<u32>() + size_of::<u64>() + self.key.len() + value_len
     }
 
     pub fn from(key: String, value: MemTableValue) -> Self {
@@ -128,5 +154,34 @@ impl SsTableEntry {
             value: value.value,
             sequence_number: value.sequence_number,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SsTableEntry;
+
+    #[test]
+    fn entry_to_bytes_value() {
+        let entry_write = SsTableEntry {
+            key: String::from("key"),
+            value: Some(String::from("value")),
+            sequence_number: 2,
+        };
+        let bytes = entry_write.to_bytes();
+        let entry_read = SsTableEntry::from_bytes(&bytes);
+        assert_eq!(entry_read, entry_write);
+    }
+
+    #[test]
+    fn entry_to_bytes_deleted_value() {
+        let entry_write = SsTableEntry {
+            key: String::from("key"),
+            value: None,
+            sequence_number: 2,
+        };
+        let bytes = entry_write.to_bytes();
+        let entry_read = SsTableEntry::from_bytes(&bytes);
+        assert_eq!(entry_read, entry_write);
     }
 }
