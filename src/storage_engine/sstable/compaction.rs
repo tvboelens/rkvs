@@ -1,5 +1,6 @@
+use crate::storage_engine::sstable::level::segment::Segment;
 use crate::storage_engine::sstable::level::{
-    LevelContainer, OverlappingLevel, PartitionedLevel, Segment, SsTableLevel,
+    LevelContainer, OverlappingLevel, PartitionedLevel, SsTableLevel,
 };
 use std::fs::remove_file;
 use std::io;
