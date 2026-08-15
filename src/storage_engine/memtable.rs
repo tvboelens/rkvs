@@ -56,11 +56,7 @@ impl MemTable {
         let segments = MemTable::find_and_open_segments(&dir, &segment_size, &sequence_number)?;
         if !segments.is_empty() {
             let mut table = HashMap::new();
-            match MemTable::recover(
-                segments,
-                (sequence_number % segment_size as u64).try_into().unwrap(),
-                &mut table,
-            ) {
+            match MemTable::recover(segments, sequence_number % segment_size as u64, &mut table) {
                 Ok(curr_size) => {
                     let segment = MemTable::open_last_segment(&dir, &segment_size)?;
                     let wal = Wal::from_segment(dir.join("WAL"), segment, segment_size);
@@ -246,13 +242,15 @@ impl MemTable {
 
     pub fn recover(
         segments: Vec<Segment>,
-        starting_offset: u32,
+        starting_offset: u64,
         table: &mut HashMap<String, MemTableValue>,
     ) -> Result<u64, (u64, RecoveryError)> {
         let mut curr_size: u64 = 0;
         let mut offset = starting_offset;
-        let mut partial_entry: Option<Vec<u8>> = None;
+        let mut partial_entry: Option<(Vec<u8>, u64)> = None;
+        let mut path: PathBuf = PathBuf::new();
         for mut segment in segments {
+            path = segment.file_path();
             let mut entries = Vec::<WalEntry>::new();
             match partial_entry {
                 None => {
@@ -287,7 +285,7 @@ impl MemTable {
                         }
                     }
                 }
-                Some(bytes) => {
+                Some((bytes, _)) => {
                     let res = segment.read_parse_validate_from_partial_record(bytes, &mut entries);
                     for entry in entries {
                         match entry.operation_type {
@@ -295,7 +293,7 @@ impl MemTable {
                                 let value = MemTableValue {
                                     sequence_number: entry.sequence_number,
                                     value: entry.value,
-                                };
+                                }; // TODO: curr_size is not correct, should subtract first if old value present
                                 curr_size += SsTableEntry::from(entry.key.clone(), value.clone())
                                     .len() as u64;
                                 _ = table.insert(entry.key, value);
@@ -304,7 +302,7 @@ impl MemTable {
                                 let value = MemTableValue {
                                     sequence_number: entry.sequence_number,
                                     value: entry.value,
-                                };
+                                }; // TODO: curr_size is not correct, should subtract first if old value present
                                 curr_size += SsTableEntry::from(entry.key.clone(), value.clone())
                                     .len() as u64;
                                 _ = table.insert(entry.key, value);
@@ -320,7 +318,10 @@ impl MemTable {
                 }
             }
         }
-        Ok(curr_size)
+        match partial_entry {
+            Some((_, pos)) => Err((curr_size, RecoveryError::Corrupted(path, pos))),
+            None => Ok(curr_size),
+        }
     }
 }
 
@@ -343,7 +344,7 @@ where
         };
         let len = SsTableEntry::from(entry.key.clone(), mvalue.clone()).len() as u64;
         let val = self.table.write().unwrap().insert(key, mvalue);
-        self.current_size += len;
+        self.current_size += len; // TODO: This is not correct, have to subtract if there is an old value
         Ok(val) // TODO: handle locking error
     }
 
@@ -362,7 +363,7 @@ where
         };
         let len = SsTableEntry::from(entry.key.clone(), mvalue.clone()).len() as u64;
         let val = self.table.write().unwrap().insert(key.clone(), mvalue);
-        self.current_size += len;
+        self.current_size += len; // TODO: This is not correct, have to subtract if there is an old value
         Ok(val)
     }
 
@@ -785,6 +786,78 @@ mod tests {
     }
 
     #[test]
+    fn recover_corrupted_wal_twice() {
+        let dir = PathBuf::from("./memtable_recover_corrupted_wal_twice");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 4096;
+        assert!(cl.setup().is_ok());
+        {
+            let memtable = MemTable::start(
+                dir.clone(),
+                segment_size.clone(),
+                0,
+                2u64.pow(32),
+                FakeFlusher {},
+            )
+            .unwrap();
+            let _ = memtable.put(String::from("key1"), String::from("value1"));
+            let _ = memtable.put(String::from("key1"), String::from("new_value1"));
+            let _ = memtable.put(String::from("key2"), String::from("value2"));
+            let _ = memtable.delete(&String::from("key2"));
+            let _ = memtable.put(String::from("key3"), String::from("value3"));
+        }
+
+        {
+            let file_paths = MemTable::list_segment_files(&dir, &0).unwrap();
+            assert_eq!(file_paths.len(), 1);
+            let file = OpenOptions::new()
+                .create(false)
+                .write(true)
+                .open(file_paths.first().unwrap())
+                .unwrap();
+            let file_size = file.metadata().unwrap().len();
+            file.set_len(file_size - 4).unwrap();
+        }
+
+        {
+            let memtable = MemTable::start(
+                dir.clone(),
+                segment_size.clone(),
+                0,
+                2u64.pow(32),
+                FakeFlusher {},
+            )
+            .unwrap();
+            let mut res = memtable.get(&String::from("key1")).unwrap();
+            assert!(matches!(res.value, Some(v) if v == String::from("new_value1")));
+            res = memtable.get(&String::from("key2")).unwrap();
+            assert!(matches!(res.value, None));
+            let res = memtable.get(&String::from("key3"));
+            assert!(matches!(res, None));
+            let _ = memtable.delete(&String::from("key2"));
+            let _ = memtable.put(String::from("key3"), String::from("new_value3"));
+            let _ = memtable.put(String::from("key4"), String::from("value4"));
+        }
+
+        let memtable = MemTable::start(
+            dir.clone(),
+            segment_size.clone(),
+            0,
+            2u64.pow(32),
+            FakeFlusher {},
+        )
+        .unwrap();
+        let res = memtable.get(&String::from("key1")).unwrap();
+        assert!(matches!(res.value, Some(v) if v == String::from("new_value1")));
+        let res = memtable.get(&String::from("key2")).unwrap();
+        assert!(matches!(res.value, None));
+        let res = memtable.get(&String::from("key3")).unwrap();
+        assert!(matches!(res.value, Some(v) if v == String::from("new_value3")));
+        let res = memtable.get(&String::from("key4")).unwrap();
+        assert!(matches!(res.value, Some(v) if v == String::from("value4")));
+    }
+
+    #[test]
     fn recover_corrupted_wal_multiple_segments() {
         let dir = PathBuf::from("./memtable_recover_corrupted_wal_multiple_segments");
         let cl = Cleanup { dir: dir.clone() };
@@ -872,8 +945,6 @@ mod tests {
         assert!(matches!(res, None));
     }
     /*
-    TODO: corrupted WAL
-    1. Single segment
-    2. multiple segments
+    TODO: corrupted WAL tests -> make sure that recovering twice is correct
      */
 }

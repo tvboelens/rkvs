@@ -143,19 +143,27 @@ impl Segment {
     pub fn read_parse_validate_from_offset(
         &mut self,
         entries: &mut Vec<WalEntry>,
-        offset: u32,
-    ) -> Result<Option<Vec<u8>>, RecoveryError> {
+        offset: u64,
+    ) -> Result<Option<(Vec<u8>, u64)>, RecoveryError> {
         let mut bytes = Vec::<u8>::new();
-        self.file.seek(io::SeekFrom::Start(offset as u64))?;
+        self.file.seek(io::SeekFrom::Start(offset))?;
         self.file.read_to_end(&mut bytes)?;
-        Segment::parse_validate_wal_entries(&self.file_path, &bytes, entries)
+        match Segment::parse_validate_wal_entries(&self.file_path, &bytes, entries) {
+            Ok(opt) => Ok(opt.map(|(vec, pos)| (vec, pos + offset))),
+            Err(e) => match e {
+                RecoveryError::Io(_) => Err(e),
+                RecoveryError::Corrupted(vec, pos) => {
+                    Err(RecoveryError::Corrupted(vec, pos + offset))
+                }
+            },
+        }
     }
 
     pub fn read_parse_validate_from_partial_record(
         &mut self,
         mut bytes: Vec<u8>,
         entries: &mut Vec<WalEntry>,
-    ) -> Result<Option<Vec<u8>>, RecoveryError> {
+    ) -> Result<Option<(Vec<u8>, u64)>, RecoveryError> {
         self.file.seek(io::SeekFrom::Start(0))?;
         self.file.read_to_end(&mut bytes)?;
         Segment::parse_validate_wal_entries(&self.file_path, &bytes, entries)
@@ -165,7 +173,7 @@ impl Segment {
         file_path: &PathBuf,
         bytes: &Vec<u8>,
         entries: &mut Vec<WalEntry>,
-    ) -> Result<Option<Vec<u8>>, RecoveryError> {
+    ) -> Result<Option<(Vec<u8>, u64)>, RecoveryError> {
         let mut offset: usize = 0;
         let mut record_len: usize;
         let mut u32_buf: [u8; size_of::<u32>()] = [0, 0, 0, 0];
@@ -202,8 +210,15 @@ impl Segment {
         if offset == bytes.len() || offset + HEADER_SIZE > bytes.len() {
             Ok(None)
         } else {
-            Ok(Some(bytes[offset..offset + HEADER_SIZE].to_vec()))
+            Ok(Some((
+                bytes[offset..offset + HEADER_SIZE].to_vec(),
+                offset as u64,
+            )))
         }
+    }
+
+    pub fn file_path(&self) -> PathBuf {
+        self.file_path.clone()
     }
 
     pub fn next_lsn(&self) -> u64 {
@@ -722,7 +737,7 @@ mod tests {
             wal_entries_write[0..wal_entries_write.len() - 1]
         );
         assert!(matches!(res, Ok(Some(_))));
-        let bytes = res.unwrap().unwrap();
+        let (bytes, _) = res.unwrap().unwrap();
         assert_eq!(
             bytes,
             wal_entries_write[wal_entries_write.len() - 1].to_bytes()[0..HEADER_SIZE].to_vec()
@@ -768,7 +783,7 @@ mod tests {
             wal_entries_write[0..wal_entries_write.len() - 1]
         );
         assert!(matches!(res, Ok(Some(_))));
-        let bytes = res.unwrap().unwrap();
+        let (bytes, _) = res.unwrap().unwrap();
         assert_eq!(
             bytes,
             wal_entries_write[wal_entries_write.len() - 1].to_bytes()[0..HEADER_SIZE].to_vec()
@@ -1011,7 +1026,7 @@ mod tests {
         segment.append(&buf).unwrap();
         assert_eq!(segment.file_size, 143);
         let mut entries_read = Vec::<WalEntry>::new();
-        let res = segment
+        let (res, _) = segment
             .read_parse_validate_from_offset(&mut entries_read, 35)
             .unwrap()
             .unwrap();
@@ -1075,7 +1090,7 @@ mod tests {
 
         assert_eq!(segment.file_size, segment_size);
         let mut entries_read = Vec::<WalEntry>::new();
-        let res = segment
+        let (res, _) = segment
             .read_parse_validate_from_offset(&mut entries_read, 35)
             .unwrap()
             .unwrap();
@@ -1206,7 +1221,7 @@ mod tests {
             .unwrap();
         assert!(matches!(res, Some(_)));
         assert_eq!(entries, entries_read);
-        assert_eq!(res.unwrap(), buf)
+        assert_eq!(res.unwrap().0, buf)
     }
 
     #[test]
@@ -1274,7 +1289,7 @@ mod tests {
             .unwrap();
         assert!(matches!(res, Some(_)));
         assert_eq!(entries, entries_read);
-        assert_eq!(res.unwrap(), buf);
+        assert_eq!(res.unwrap().0, buf);
     }
 
     struct FilenameTest {
