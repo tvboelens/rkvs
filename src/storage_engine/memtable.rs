@@ -28,7 +28,6 @@ enum WriteJob {
 }
 
 pub struct MemTable {
-    // TODO: maybe need a custom data type, since we might want to store the LSN as well
     table: Arc<RwLock<HashMap<String, MemTableValue>>>,
     sender: Sender<WriteJob>,
     writer_handle: JoinHandle<()>,
@@ -107,7 +106,6 @@ impl MemTable {
             current_size: curr_size,
             max_size: max_size,
         };
-        // TODO: implement run and start thread that calls it
         let handle = std::thread::spawn(move || worker.run());
         MemTable {
             table: table_ptr.clone(),
@@ -391,6 +389,7 @@ where
                 }
             }
         }
+        // TODO: regular sync of WAL
     }
 }
 
@@ -741,5 +740,52 @@ mod tests {
         assert!(matches!(res.value, Some(value) if value == String::from("value3")));
     }
 
-    // TODO: corrupted WAL
+    #[test]
+    fn recover_corrupted_wal() {
+        let dir = PathBuf::from("./memtable_recover_corrupted_wal");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 4096;
+        assert!(cl.setup().is_ok());
+        {
+            let memtable = MemTable::start(
+                dir.clone(),
+                segment_size.clone(),
+                0,
+                2u64.pow(32),
+                FakeFlusher {},
+            )
+            .unwrap();
+            let _ = memtable.put(String::from("key1"), String::from("value1"));
+            let _ = memtable.put(String::from("key1"), String::from("new_value1"));
+            let _ = memtable.put(String::from("key2"), String::from("value2"));
+            let _ = memtable.delete(&String::from("key2"));
+            let _ = memtable.put(String::from("key3"), String::from("value3"));
+        }
+
+        {
+            let file_paths = MemTable::list_segment_files(&dir, &0).unwrap();
+            assert_eq!(file_paths.len(), 1);
+            let file = OpenOptions::new()
+                .create(false)
+                .write(true)
+                .open(file_paths.first().unwrap())
+                .unwrap();
+            let file_size = file.metadata().unwrap().len();
+            file.set_len(file_size - 4).unwrap();
+        }
+
+        let memtable =
+            MemTable::start(dir, segment_size.clone(), 0, 2u64.pow(32), FakeFlusher {}).unwrap();
+        let mut res = memtable.get(&String::from("key1")).unwrap();
+        assert!(matches!(res.value, Some(v) if v == String::from("new_value1")));
+        res = memtable.get(&String::from("key2")).unwrap();
+        assert!(matches!(res.value, None));
+        let res = memtable.get(&String::from("key3"));
+        assert!(matches!(res, None));
+    }
+    /*
+    TODO: corrupted WAL
+    1. Single segment
+    2. multiple segments
+     */
 }
