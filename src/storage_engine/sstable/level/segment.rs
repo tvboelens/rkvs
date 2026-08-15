@@ -527,16 +527,191 @@ mod tests {
             },
         );
         assert_eq!(value.unwrap(), entry);
+        let value = segment.get(&String::from("absent_key")).unwrap();
+        assert!(matches!(value, None));
+        let value = segment.get(&String::from("l_absent_key")).unwrap();
+        assert!(matches!(value, None));
+    }
+
+    #[test]
+    fn segment_basic_get_multiple_keys() {
+        let dir = PathBuf::from("./sstable_segment_basic_get_multiple_keys");
+        let cl = Cleanup { dir: dir.clone() };
+        assert!(cl.setup().is_ok());
+        let mut table = HashMap::new();
+        let kv_pairs = vec![
+            (
+                String::from("first_key"),
+                MemTableValue {
+                    value: Some(String::from("first_value")),
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("second_key"),
+                MemTableValue {
+                    value: Some(String::from("second_value")),
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("third_key"),
+                MemTableValue {
+                    value: Some(String::from("third_value")),
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("fourth_key"),
+                MemTableValue {
+                    value: Some(String::from("fourth_value")),
+                    sequence_number: 2,
+                },
+            ),
+        ];
+        let entries_write: Vec<Option<SsTableEntry>> = kv_pairs
+            .iter()
+            .map(|(key, value)| Some(SsTableEntry::from(key.clone(), value.clone())))
+            .collect();
+        for (key, value) in &kv_pairs {
+            table.insert(key.clone(), value.clone());
+        }
+        let sequence_number = 0;
+        let sparsity_factor = 1;
+        let fp =
+            Segment::write_segment_file(&dir, &table, &sequence_number, &sparsity_factor).unwrap();
+        let segment = Segment::from_file(fp).unwrap();
+        assert_eq!(segment.first_key, String::from("first_key"));
+        assert_eq!(segment.last_key, String::from("third_key"));
+        let mut entries_read = Vec::<Option<SsTableEntry>>::new();
+        for (key, _) in &kv_pairs {
+            entries_read.push(segment.get(key).unwrap());
+        }
+        assert_eq!(entries_read, entries_write);
+        let value = segment.get(&String::from("absent_key")).unwrap();
+        assert!(matches!(value, None));
+        let value = segment.get(&String::from("l_absent_key")).unwrap();
+        assert!(matches!(value, None));
+        let value = segment.get(&String::from("z_absent_key")).unwrap();
+        assert!(matches!(value, None));
+    }
+
+    #[test]
+    fn segment_basic_get_multiple_keys_sparse_index() {
+        let dir = PathBuf::from("./sstable_segment_basic_get_multiple_keys_sparse_index");
+        let cl = Cleanup { dir: dir.clone() };
+        assert!(cl.setup().is_ok());
+        let mut table = HashMap::new();
+        let kv_pairs = vec![
+            (
+                String::from("first_key"),
+                MemTableValue {
+                    value: Some(String::from("first_value")),
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("second_key"),
+                MemTableValue {
+                    value: Some(String::from("second_value")),
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("third_key"),
+                MemTableValue {
+                    value: Some(String::from("third_value")),
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("fourth_key"),
+                MemTableValue {
+                    value: Some(String::from("fourth_value")),
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("fifth_key"),
+                MemTableValue {
+                    value: Some(String::from("fifth_value")),
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("sixth_key"),
+                MemTableValue {
+                    value: Some(String::from("sixth_value")),
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("seventh_key"),
+                MemTableValue {
+                    value: Some(String::from("seventh_value")),
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("eighth_key"),
+                MemTableValue {
+                    value: Some(String::from("eighth_value")),
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("ninth_key"),
+                MemTableValue {
+                    value: Some(String::from("ninth_value")),
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("tenth_key"),
+                MemTableValue {
+                    value: Some(String::from("tenth_value")),
+                    sequence_number: 2,
+                },
+            ),
+        ];
+        let entries_write: Vec<Option<SsTableEntry>> = kv_pairs
+            .iter()
+            .map(|(key, value)| Some(SsTableEntry::from(key.clone(), value.clone())))
+            .collect();
+        for (key, value) in &kv_pairs {
+            table.insert(key.clone(), value.clone());
+        }
+        let sequence_number = 0;
+        let sparsity_factor = 4;
+        let fp =
+            Segment::write_segment_file(&dir, &table, &sequence_number, &sparsity_factor).unwrap();
+        let segment = Segment::from_file(fp).unwrap();
+        assert_eq!(segment.first_key, String::from("eighth_key"));
+        assert_eq!(segment.last_key, String::from("third_key"));
+
+        let mut entries_read = Vec::<Option<SsTableEntry>>::new();
+        for (key, _) in &kv_pairs {
+            entries_read.push(segment.get(key).unwrap());
+        }
+
+        assert_eq!(entries_read, entries_write);
+        let value = segment.get(&String::from("absent_key")).unwrap();
+        assert!(matches!(value, None));
+        let value = segment.get(&String::from("l_absent_key")).unwrap();
+        assert!(matches!(value, None));
+        let value = segment.get(&String::from("z_absent_key")).unwrap();
+        assert!(matches!(value, None));
     }
 }
 
 /*
 TODO testing:
-1. Key not in segment
+1. Key not in segment -> done
     1. Key we are looking for would come before the first key in segment
     2. Key we are looking for is "between" two keys in the segment
     3. Key we are looking for would come after the last key in segment
-2. Lookup in segment with sparse indexing
+2. Lookup in segment with sparse indexing -> done
     1. Key present
     2. Key not present
+3. Segment::parse_entries
 */
