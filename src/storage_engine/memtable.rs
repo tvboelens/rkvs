@@ -783,6 +783,94 @@ mod tests {
         let res = memtable.get(&String::from("key3"));
         assert!(matches!(res, None));
     }
+
+    #[test]
+    fn recover_corrupted_wal_multiple_segments() {
+        let dir = PathBuf::from("./memtable_recover_corrupted_wal_multiple_segments");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 64;
+        assert!(cl.setup().is_ok());
+        {
+            let memtable = MemTable::start(
+                dir.clone(),
+                segment_size.clone(),
+                0,
+                2u64.pow(32),
+                FakeFlusher {},
+            )
+            .unwrap();
+            let _ = memtable.put(String::from("key1"), String::from("value1"));
+            let _ = memtable.put(String::from("key1"), String::from("new_value1"));
+            let _ = memtable.put(String::from("key2"), String::from("value2"));
+            let _ = memtable.put(String::from("key3"), String::from("value3"));
+            let _ = memtable.delete(&String::from("key3"));
+        }
+
+        {
+            let file_paths = MemTable::list_segment_files(&dir, &0).unwrap();
+            assert!(file_paths.len() > 1);
+            let file = OpenOptions::new()
+                .create(false)
+                .write(true)
+                .open(file_paths.last().unwrap())
+                .unwrap();
+            let file_size = file.metadata().unwrap().len();
+            file.set_len(file_size - 4).unwrap();
+        }
+
+        let memtable =
+            MemTable::start(dir, segment_size.clone(), 0, 2u64.pow(32), FakeFlusher {}).unwrap();
+        let mut res = memtable.get(&String::from("key1")).unwrap();
+        assert!(matches!(res.value, Some(v) if v == String::from("new_value1")));
+        res = memtable.get(&String::from("key2")).unwrap();
+        assert!(matches!(res.value, Some(v) if v == String::from("value2")));
+        res = memtable.get(&String::from("key3")).unwrap();
+        assert!(matches!(res.value, Some(v) if v == String::from("value3")));
+    }
+
+    #[test]
+    fn recover_corrupted_wal_multiple_segments_middle() {
+        let dir = PathBuf::from("./memtable_recover_corrupted_wal_multiple_segments_middle");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 64;
+        assert!(cl.setup().is_ok());
+        {
+            let memtable = MemTable::start(
+                dir.clone(),
+                segment_size.clone(),
+                0,
+                2u64.pow(32),
+                FakeFlusher {},
+            )
+            .unwrap();
+            let _ = memtable.put(String::from("key1"), String::from("value1")); // 0 -> 35
+            let _ = memtable.put(String::from("key1"), String::from("new_value1")); //35 -> 74
+            let _ = memtable.put(String::from("key2"), String::from("value2")); // 74 -> 109
+            let _ = memtable.delete(&String::from("key2")); // 109 -> 134
+            let _ = memtable.put(String::from("key3"), String::from("value3")); // 134 -> 169
+        }
+
+        {
+            let file_paths = MemTable::list_segment_files(&dir, &0).unwrap();
+            assert!(file_paths.len() > 2);
+            let file = OpenOptions::new()
+                .create(false)
+                .write(true)
+                .open(file_paths[1].clone())
+                .unwrap();
+            let file_size = file.metadata().unwrap().len();
+            file.set_len(file_size - 4).unwrap();
+        }
+
+        let memtable =
+            MemTable::start(dir, segment_size.clone(), 0, 2u64.pow(32), FakeFlusher {}).unwrap();
+        let res = memtable.get(&String::from("key1")).unwrap();
+        assert!(matches!(res.value, Some(v) if v == String::from("new_value1")));
+        let res = memtable.get(&String::from("key2"));
+        assert!(matches!(res, None));
+        let res = memtable.get(&String::from("key3"));
+        assert!(matches!(res, None));
+    }
     /*
     TODO: corrupted WAL
     1. Single segment
