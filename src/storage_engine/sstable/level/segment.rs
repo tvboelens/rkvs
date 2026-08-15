@@ -17,6 +17,8 @@ pub struct Segment {
     size: u64,
     data_block_end: u64,
     number: u64,
+    first_key: String,
+    last_key: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -67,8 +69,18 @@ impl Segment {
         rfile.seek(io::SeekFrom::Start(footer.index_offset))?;
         rfile.read_exact(&mut index_buf)?;
         let index = SegmentIndex::from_bytes(&index_buf);
-        let highest_sequence_no = 0;
-        let segment_number = 0;
+        let first_key = Segment::read_table_entry(&rfile, &0)?.key;
+        let start: u64 = match index.indices.last() {
+            None => 0,
+            Some(idx) => idx.offset,
+        };
+        let entries = Segment::read_table_entries(&rfile, start, footer.index_offset)?;
+        let last_key = match entries.last() {
+            None => first_key.clone(),
+            Some(entry) => entry.key.to_owned(),
+        };
+        let highest_sequence_no = 0; // TODO
+        let segment_number = 0; // TODO: from filename
         Ok(Segment {
             file: rfile,
             filepath: path,
@@ -77,17 +89,19 @@ impl Segment {
             size: metadata.size(),
             number: segment_number,
             data_block_end: footer.index_offset,
+            first_key: first_key,
+            last_key: last_key,
         })
     }
 
     pub fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>> {
         match self.index.find(key) {
             IndexSearchResult::Match(offset) => {
-                self.read_table_entry(&offset).map(|entry| Some(entry))
+                Segment::read_table_entry(&self.file, &offset).map(|entry| Some(entry))
             }
             IndexSearchResult::Range(start, opt) => {
                 let end = opt.unwrap_or(self.data_block_end);
-                let entries = self.read_table_entries(start, end)?;
+                let entries = Segment::read_table_entries(&self.file, start, end)?;
                 for entry in entries {
                     if entry.key == *key {
                         return Ok(Some(entry));
@@ -100,31 +114,35 @@ impl Segment {
         }
     }
 
-    fn read_table_entries(&self, start: u64, end: u64) -> io::Result<Vec<SsTableEntry>> {
+    pub fn first_key(&self) -> &String {
+        &self.first_key
+    }
+
+    pub fn last_key(&self) -> &String {
+        &self.last_key
+    }
+
+    fn read_table_entries(file: &File, start: u64, end: u64) -> io::Result<Vec<SsTableEntry>> {
         let mut curr_offset = start.clone();
         let mut buf = Vec::<u8>::new();
         buf.resize(end as usize - start as usize, 0);
         let mut buf_offset: usize = 0;
         let mut bytes_read: usize = 0;
         while bytes_read < buf.len() {
-            bytes_read += self
-                .file
-                .read_at(&mut buf[buf_offset..], curr_offset.clone())?;
+            bytes_read += file.read_at(&mut buf[buf_offset..], curr_offset.clone())?;
             buf_offset += bytes_read;
             curr_offset += bytes_read as u64;
         }
         Ok(Segment::parse_entries(buf))
     }
 
-    fn read_table_entry(&self, offset: &u64) -> io::Result<SsTableEntry> {
+    fn read_table_entry(file: &File, offset: &u64) -> io::Result<SsTableEntry> {
         let mut curr_offset = offset.clone();
         let mut buf_offset: usize = 0;
         let mut u32_buf: [u8; size_of::<u32>()] = [0, 0, 0, 0];
         let mut bytes_read: usize = 0;
         while bytes_read < size_of::<u32>() {
-            bytes_read += self
-                .file
-                .read_at(&mut u32_buf[buf_offset..], curr_offset.clone())?;
+            bytes_read += file.read_at(&mut u32_buf[buf_offset..], curr_offset.clone())?;
             buf_offset += bytes_read;
             curr_offset += bytes_read as u64;
         }
@@ -134,9 +152,7 @@ impl Segment {
         bytes_read = 0;
         buf_offset = 0;
         while bytes_read < entry_len as usize {
-            bytes_read += self
-                .file
-                .read_at(&mut entry_buf[buf_offset..], curr_offset.clone())?;
+            bytes_read += file.read_at(&mut entry_buf[buf_offset..], curr_offset.clone())?;
             buf_offset += bytes_read;
             curr_offset += bytes_read as u64;
         }
@@ -209,11 +225,11 @@ impl Segment {
     fn parse_entries(buf: Vec<u8>) -> Vec<SsTableEntry> {
         let mut res = Vec::new();
         let mut offset: usize = 0;
-        let mut u64_buf: [u8; size_of::<u64>()] = [0, 0, 0, 0, 0, 0, 0, 0];
+        let mut u32_buf: [u8; size_of::<u32>()] = [0, 0, 0, 0];
         while offset < buf.len() {
-            u64_buf.copy_from_slice(&buf[offset..offset + size_of::<u64>()]);
-            let record_len = u64::from_le_bytes(u64_buf);
-            offset += size_of::<u64>();
+            u32_buf.copy_from_slice(&buf[offset..offset + size_of::<u32>()]);
+            let record_len = u32::from_le_bytes(u32_buf);
+            offset += size_of::<u32>();
             res.push(SsTableEntry::from_bytes(
                 &buf[offset..offset + record_len as usize].to_vec(),
             ));
@@ -499,6 +515,8 @@ mod tests {
         let fp =
             Segment::write_segment_file(&dir, &table, &sequence_number, &sparsity_factor).unwrap();
         let segment = Segment::from_file(fp).unwrap();
+        assert_eq!(segment.first_key, String::from("key"));
+        assert_eq!(segment.last_key, String::from("key"));
         let value = segment.get(&String::from("key")).unwrap();
         assert!(value.is_some());
         let entry = SsTableEntry::from(
