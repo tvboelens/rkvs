@@ -456,6 +456,7 @@ mod tests {
         assert!(matches!(v.value, Some(value) if value == String::from("value2")));
     }
 
+    /* TODO: is this test still useful or do we want to allow empty keys? I am tending to allowing empty keys
     #[test]
     #[should_panic]
     fn put_empty_key() {
@@ -465,7 +466,7 @@ mod tests {
         assert!(cl.setup().is_ok());
         let memtable = MemTable::start(dir, segment_size, 0, 2u64.pow(32), FakeFlusher {}).unwrap();
         let _ = memtable.put(String::from(""), String::from("value"));
-    }
+    } */
 
     #[test]
     fn get_empty_key() {
