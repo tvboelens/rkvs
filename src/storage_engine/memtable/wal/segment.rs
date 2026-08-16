@@ -44,6 +44,12 @@ pub struct WalEntry {
     pub sequence_number: u64,
 }
 
+pub struct PartialWalEntry {
+    pub segment_file_path: PathBuf,
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+}
+
 pub fn calculate_checksum(buf: &[u8]) -> u32 {
     let crc32 = crc::Crc::<u32>::new(&CHECKSUM_ALG);
     let mut digest = crc32.digest();
@@ -144,16 +150,19 @@ impl Segment {
         &mut self,
         entries: &mut Vec<WalEntry>,
         offset: u64,
-    ) -> Result<Option<(Vec<u8>, u64)>, RecoveryError> {
+    ) -> Result<Option<PartialWalEntry>, RecoveryError> {
         let mut bytes = Vec::<u8>::new();
         self.file.seek(io::SeekFrom::Start(offset))?;
         self.file.read_to_end(&mut bytes)?;
         match Segment::parse_validate_wal_entries(&self.file_path, &bytes, entries) {
-            Ok(opt) => Ok(opt.map(|(vec, pos)| (vec, pos + offset))),
+            Ok(opt) => Ok(opt.map(|mut entry| {
+                entry.offset += offset;
+                entry
+            })),
             Err(e) => match e {
                 RecoveryError::Io(_) => Err(e),
-                RecoveryError::Corrupted(vec, pos) => {
-                    Err(RecoveryError::Corrupted(vec, pos + offset))
+                RecoveryError::Corrupted(fp, pos) => {
+                    Err(RecoveryError::Corrupted(fp, pos + offset))
                 }
             },
         }
@@ -163,18 +172,37 @@ impl Segment {
         &mut self,
         mut bytes: Vec<u8>,
         entries: &mut Vec<WalEntry>,
-    ) -> Result<Option<(Vec<u8>, u64)>, RecoveryError> {
+    ) -> Result<Option<PartialWalEntry>, RecoveryError> {
+        let part_rec_size = bytes.len() as u64;
         self.file.seek(io::SeekFrom::Start(0))?;
         self.file.read_to_end(&mut bytes)?;
-        Segment::parse_validate_wal_entries(&self.file_path, &bytes, entries)
+        match Segment::parse_validate_wal_entries(&self.file_path, &bytes, entries) {
+            Ok(opt) => Ok(opt.map(|mut part_entry| {
+                part_entry.offset -= part_rec_size;
+                part_entry
+            })),
+            Err(e) => match e {
+                RecoveryError::Io(_) => Err(e),
+                RecoveryError::Corrupted(fp, buf_offset) => {
+                    let offset: u64;
+                    if buf_offset > part_rec_size {
+                        offset = buf_offset - part_rec_size;
+                    } else {
+                        offset = buf_offset;
+                    }
+                    Err(RecoveryError::Corrupted(fp, offset))
+                }
+            },
+        }
     }
 
     fn parse_validate_wal_entries(
         file_path: &PathBuf,
         bytes: &Vec<u8>,
         entries: &mut Vec<WalEntry>,
-    ) -> Result<Option<(Vec<u8>, u64)>, RecoveryError> {
+    ) -> Result<Option<PartialWalEntry>, RecoveryError> {
         let mut offset: usize = 0;
+        let mut record_offset: u64 = 0;
         let mut record_len: usize;
         let mut u32_buf: [u8; size_of::<u32>()] = [0, 0, 0, 0];
         loop {
@@ -182,7 +210,7 @@ impl Segment {
                 // padded
                 break;
             }
-            let record_offset: u64 = offset as u64;
+            record_offset = offset as u64;
             u32_buf.copy_from_slice(&bytes[offset..offset + size_of::<u32>()]);
             record_len = u32::from_le_bytes(u32_buf) as usize;
             if record_len < HEADER_SIZE - size_of::<u32>() {
@@ -210,15 +238,13 @@ impl Segment {
         if offset == bytes.len() || offset + HEADER_SIZE > bytes.len() {
             Ok(None)
         } else {
-            Ok(Some((
-                bytes[offset..offset + HEADER_SIZE].to_vec(),
-                offset as u64,
-            )))
+            let partial_entry = PartialWalEntry {
+                bytes: bytes[offset..offset + HEADER_SIZE].to_vec(),
+                offset: record_offset,
+                segment_file_path: file_path.clone(),
+            };
+            Ok(Some(partial_entry))
         }
-    }
-
-    pub fn file_path(&self) -> PathBuf {
-        self.file_path.clone()
     }
 
     pub fn next_lsn(&self) -> u64 {
@@ -737,9 +763,9 @@ mod tests {
             wal_entries_write[0..wal_entries_write.len() - 1]
         );
         assert!(matches!(res, Ok(Some(_))));
-        let (bytes, _) = res.unwrap().unwrap();
+        let partial_entry = res.unwrap().unwrap();
         assert_eq!(
-            bytes,
+            partial_entry.bytes,
             wal_entries_write[wal_entries_write.len() - 1].to_bytes()[0..HEADER_SIZE].to_vec()
         );
     }
@@ -783,9 +809,9 @@ mod tests {
             wal_entries_write[0..wal_entries_write.len() - 1]
         );
         assert!(matches!(res, Ok(Some(_))));
-        let (bytes, _) = res.unwrap().unwrap();
+        let partial_entry = res.unwrap().unwrap();
         assert_eq!(
-            bytes,
+            partial_entry.bytes,
             wal_entries_write[wal_entries_write.len() - 1].to_bytes()[0..HEADER_SIZE].to_vec()
         );
     }
@@ -1026,12 +1052,12 @@ mod tests {
         segment.append(&buf).unwrap();
         assert_eq!(segment.file_size, 143);
         let mut entries_read = Vec::<WalEntry>::new();
-        let (res, _) = segment
+        let partial_wal_entry = segment
             .read_parse_validate_from_offset(&mut entries_read, 35)
             .unwrap()
             .unwrap();
         assert_eq!(entries[1..], entries_read);
-        assert_eq!(res, buf);
+        assert_eq!(partial_wal_entry.bytes, buf);
     }
 
     #[test]
@@ -1090,12 +1116,12 @@ mod tests {
 
         assert_eq!(segment.file_size, segment_size);
         let mut entries_read = Vec::<WalEntry>::new();
-        let (res, _) = segment
+        let partial_wal_entry = segment
             .read_parse_validate_from_offset(&mut entries_read, 35)
             .unwrap()
             .unwrap();
         assert_eq!(entries[1..], entries_read);
-        assert_eq!(res, buf);
+        assert_eq!(partial_wal_entry.bytes, buf);
     }
 
     #[test]
@@ -1216,12 +1242,12 @@ mod tests {
         segment.pad().unwrap();
         assert_eq!(segment.file_size, segment_size);
         let mut entries_read = Vec::<WalEntry>::new();
-        let res = segment
+        let partial_wal_entry = segment
             .read_parse_validate_from_partial_record(header, &mut entries_read)
             .unwrap();
-        assert!(matches!(res, Some(_)));
+        assert!(matches!(partial_wal_entry, Some(_)));
         assert_eq!(entries, entries_read);
-        assert_eq!(res.unwrap().0, buf)
+        assert_eq!(partial_wal_entry.unwrap().bytes, buf)
     }
 
     #[test]
@@ -1284,12 +1310,12 @@ mod tests {
         segment.append(&buf).unwrap();
         assert_eq!(segment.file_size, 130);
         let mut entries_read = Vec::<WalEntry>::new();
-        let res = segment
+        let partial_wal_entry = segment
             .read_parse_validate_from_partial_record(header, &mut entries_read)
             .unwrap();
-        assert!(matches!(res, Some(_)));
+        assert!(matches!(partial_wal_entry, Some(_)));
         assert_eq!(entries, entries_read);
-        assert_eq!(res.unwrap().0, buf);
+        assert_eq!(partial_wal_entry.unwrap().bytes, buf);
     }
 
     struct FilenameTest {

@@ -9,7 +9,7 @@ use std::sync::{
 use std::thread::JoinHandle;
 use std::{collections::HashMap, io};
 use wal::segment::{OpType, RecoveryError, Segment, final_entry_after};
-use wal::{Wal, segment::WalEntry};
+use wal::{Wal, segment::PartialWalEntry, segment::WalEntry};
 
 use crate::storage_engine::memtable_flusher::MemTableFlush;
 use crate::storage_engine::sstable::SsTableEntry;
@@ -47,19 +47,20 @@ where
 
 impl MemTable {
     pub fn start<T: MemTableFlush + Send + Sync + Sized + 'static>(
-        dir: PathBuf,
+        wal_dir: PathBuf,
         segment_size: u32,
         sequence_number: u64,
         max_size: u64,
         flusher: T,
     ) -> io::Result<Self> {
-        let segments = MemTable::find_and_open_segments(&dir, &segment_size, &sequence_number)?;
+        std::fs::create_dir_all(&wal_dir)?;
+        let segments = MemTable::find_and_open_segments(&wal_dir, &segment_size, &sequence_number)?;
         if !segments.is_empty() {
             let mut table = HashMap::new();
             match MemTable::recover(segments, sequence_number % segment_size as u64, &mut table) {
                 Ok(curr_size) => {
-                    let segment = MemTable::open_last_segment(&dir, &segment_size)?;
-                    let wal = Wal::from_segment(dir.join("WAL"), segment, segment_size);
+                    let segment = MemTable::open_last_segment(&wal_dir, &segment_size)?;
+                    let wal = Wal::from_segment(wal_dir, segment, segment_size);
                     return Ok(MemTable::from(table, wal, flusher, curr_size, max_size));
                 }
                 Err((curr_size, e)) => match e {
@@ -67,11 +68,12 @@ impl MemTable {
                     RecoveryError::Corrupted(fp, offset) => {
                         let segment =
                             MemTable::truncate_and_open_segment_file(fp, offset, segment_size)?;
-                        let file_paths = MemTable::list_segment_files(&dir, &segment.next_lsn())?;
+                        let file_paths =
+                            MemTable::list_segment_files(&wal_dir, &segment.next_lsn())?;
                         for fp in file_paths {
                             fs::remove_file(fp)?;
                         }
-                        let wal = Wal::from_segment(dir.join("WAL"), segment, segment_size);
+                        let wal = Wal::from_segment(wal_dir, segment, segment_size);
                         return Ok(MemTable::from(table, wal, flusher, curr_size, max_size));
                     }
                     RecoveryError::Io(err) => {
@@ -80,7 +82,7 @@ impl MemTable {
                 },
             }
         } else {
-            let wal = Wal::create_new(dir, segment_size)?;
+            let wal = Wal::create_new(wal_dir, segment_size)?;
             Ok(MemTable::from(HashMap::new(), wal, flusher, 0, max_size))
         }
     }
@@ -152,7 +154,7 @@ impl MemTable {
         sequence_number: &u64,
     ) -> io::Result<Vec<Segment>> {
         let mut segments = Vec::<Segment>::new();
-        let segment_file_paths = MemTable::list_segment_files(dir, sequence_number)?;
+        let segment_file_paths = MemTable::list_segment_files(&dir, sequence_number)?;
         for fp in segment_file_paths {
             let segment_file = File::open(&fp)?;
             let file_size = segment_file.metadata()?.len();
@@ -246,12 +248,13 @@ impl MemTable {
         table: &mut HashMap<String, MemTableValue>,
     ) -> Result<u64, (u64, RecoveryError)> {
         let mut curr_size: u64 = 0;
+        // starting offset is actually only used for the first segment, else we need to check in the loop
+        // whether the segment is the first segment, so use once and then set it to 0
         let mut offset = starting_offset;
-        let mut partial_entry: Option<(Vec<u8>, u64)> = None;
-        let mut path: PathBuf = PathBuf::new();
+        let mut partial_entry: Option<PartialWalEntry> = None;
         for mut segment in segments {
-            path = segment.file_path();
             let mut entries = Vec::<WalEntry>::new();
+            // different cases depending on whether the final entry of a segment is fully written or not
             match partial_entry {
                 None => {
                     let res = segment.read_parse_validate_from_offset(&mut entries, offset);
@@ -278,6 +281,8 @@ impl MemTable {
                         }
                     }
                     offset = 0;
+                    // if corrupted stop at this segment, so that we know we have to truncate this
+                    // segment and delete the following segments, else continue
                     match res {
                         Ok(opt) => partial_entry = opt,
                         Err(e) => {
@@ -285,8 +290,10 @@ impl MemTable {
                         }
                     }
                 }
-                Some((bytes, _)) => {
-                    let res = segment.read_parse_validate_from_partial_record(bytes, &mut entries);
+                Some(part_entry) => {
+                    let res = segment
+                        .read_parse_validate_from_partial_record(part_entry.bytes, &mut entries);
+                    let no_current_entries = entries.is_empty();
                     for entry in entries {
                         match entry.operation_type {
                             OpType::Delete => {
@@ -309,17 +316,34 @@ impl MemTable {
                             }
                         }
                     }
+                    // if corrupted stop at this segment, so that we know we have to truncate this
+                    // segment and delete the following segments, else continue
                     match res {
                         Ok(opt) => partial_entry = opt,
                         Err(e) => {
-                            return Err((curr_size, e));
+                            if no_current_entries {
+                                return Err((
+                                    curr_size,
+                                    RecoveryError::Corrupted(
+                                        part_entry.segment_file_path,
+                                        part_entry.offset,
+                                    ),
+                                ));
+                            } else {
+                                return Err((curr_size, e));
+                            }
                         }
                     }
                 }
             }
         }
+        // if the last segment contains a partial entry at the end, it is corrupted,
+        // this cannot be detected by the segment itself, since it cannot know it is the last
         match partial_entry {
-            Some((_, pos)) => Err((curr_size, RecoveryError::Corrupted(path, pos))),
+            Some(entry) => Err((
+                curr_size,
+                RecoveryError::Corrupted(entry.segment_file_path, entry.offset),
+            )),
             None => Ok(curr_size),
         }
     }
@@ -943,6 +967,78 @@ mod tests {
         assert!(matches!(res, None));
         let res = memtable.get(&String::from("key3"));
         assert!(matches!(res, None));
+    }
+
+    #[test]
+    fn recover_corrupted_wal_twice_multiple_segments() {
+        let dir = PathBuf::from("./memtable_recover_corrupted_wal_twice_multiple_segments");
+        let cl = Cleanup { dir: dir.clone() };
+        let segment_size = 64;
+        assert!(cl.setup().is_ok());
+        {
+            let memtable = MemTable::start(
+                dir.clone(),
+                segment_size.clone(),
+                0,
+                2u64.pow(32),
+                FakeFlusher {},
+            )
+            .unwrap();
+            let _ = memtable.put(String::from("key1"), String::from("value1"));
+            let _ = memtable.put(String::from("key2"), String::from("value2"));
+            let _ = memtable.put(String::from("key1"), String::from("new_value1"));
+            let _ = memtable.delete(&String::from("key2"));
+            let _ = memtable.put(String::from("key3"), String::from("value3"));
+        }
+
+        {
+            let file_paths = MemTable::list_segment_files(&dir, &0).unwrap();
+            assert!(file_paths.len() > 2);
+            let file = OpenOptions::new()
+                .create(false)
+                .write(true)
+                .open(file_paths[1].clone())
+                .unwrap();
+            let file_size = file.metadata().unwrap().len();
+            file.set_len(file_size - 4).unwrap();
+        }
+
+        {
+            let memtable = MemTable::start(
+                dir.clone(),
+                segment_size.clone(),
+                0,
+                2u64.pow(32),
+                FakeFlusher {},
+            )
+            .unwrap();
+            let mut res = memtable.get(&String::from("key1")).unwrap();
+            assert!(matches!(res.value, Some(v) if v == String::from("value1")));
+            res = memtable.get(&String::from("key2")).unwrap();
+            assert!(matches!(res.value, Some(v) if v == String::from("value2")));
+            let res = memtable.get(&String::from("key3"));
+            assert!(matches!(res, None));
+            let _ = memtable.delete(&String::from("key2"));
+            let _ = memtable.put(String::from("key3"), String::from("new_value3"));
+            let _ = memtable.put(String::from("key4"), String::from("value4"));
+        }
+
+        let memtable = MemTable::start(
+            dir.clone(),
+            segment_size.clone(),
+            0,
+            2u64.pow(32),
+            FakeFlusher {},
+        )
+        .unwrap();
+        let res = memtable.get(&String::from("key1")).unwrap();
+        assert!(matches!(res.value, Some(v) if v == String::from("value1")));
+        let res = memtable.get(&String::from("key2")).unwrap();
+        assert!(matches!(res.value, None));
+        let res = memtable.get(&String::from("key3")).unwrap();
+        assert!(matches!(res.value, Some(v) if v == String::from("new_value3")));
+        let res = memtable.get(&String::from("key4")).unwrap();
+        assert!(matches!(res.value, Some(v) if v == String::from("value4")));
     }
     /*
     TODO: corrupted WAL tests -> make sure that recovering twice is correct
