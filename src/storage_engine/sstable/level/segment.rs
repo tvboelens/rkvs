@@ -219,7 +219,7 @@ impl Segment {
         let mut sequence_number_hex_str = format!("{:x}", sequence_number);
         padding_bytes.resize(8 - sequence_number_hex_str.len(), 48); // "0" = 0x30 = 48
         sequence_number_hex_str.insert_str(0, &String::from_utf8(padding_bytes).unwrap());
-        level_number_str + &sequence_number_hex_str
+        level_number_str + &sequence_number_hex_str + ".sst"
     }
 
     fn parse_entries(buf: Vec<u8>) -> Vec<SsTableEntry> {
