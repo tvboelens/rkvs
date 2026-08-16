@@ -116,7 +116,7 @@ impl StorageEngine {
             Arc::new(config.sstable_index_sparsity_factor),
         );
         let memtable = memtable::MemTable::start(
-            config.dir,
+            config.dir.join("WAL"),
             config.segment_size,
             0,
             config.memtable_max_size,
