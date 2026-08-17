@@ -9,10 +9,6 @@ pub mod segment;
 pub trait Level {
     fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>>;
     fn segments_to_merge(&self) -> Vec<Arc<Segment>>;
-    fn merge(
-        &self,
-        segments: &Vec<Arc<Segment>>,
-    ) -> io::Result<(Arc<SsTableLevel<PartitionedLevel>>, Vec<Arc<Segment>>)>;
     fn exceeds_target_size(&self) -> bool;
 }
 
@@ -89,13 +85,6 @@ impl Level for OverlappingLevel {
         let size: u64 = self.segments.iter().map(|segment| segment.size()).sum();
         size > self.target_size
     }
-
-    fn merge(
-        &self,
-        _segments: &Vec<Arc<Segment>>,
-    ) -> io::Result<(Arc<SsTableLevel<PartitionedLevel>>, Vec<Arc<Segment>>)> {
-        todo!()
-    }
 }
 
 impl Level for PartitionedLevel {
@@ -114,13 +103,6 @@ impl Level for PartitionedLevel {
         let size: u64 = self.segments.iter().map(|segment| segment.size()).sum();
         size > self.target_size
     }
-
-    fn merge(
-        &self,
-        _segments: &Vec<Arc<Segment>>,
-    ) -> io::Result<(Arc<SsTableLevel<PartitionedLevel>>, Vec<Arc<Segment>>)> {
-        todo!()
-    }
 }
 
 impl PartitionedLevel {
@@ -130,6 +112,13 @@ impl PartitionedLevel {
         } else {
             todo!()
         }
+    }
+
+    fn merge(
+        &self,
+        _segments: &Vec<Arc<Segment>>,
+    ) -> io::Result<(Arc<SsTableLevel<PartitionedLevel>>, Vec<Arc<Segment>>)> {
+        todo!()
     }
 }
 
@@ -152,13 +141,6 @@ where
     pub fn exceeds_target_size(&self) -> bool {
         self.inner.exceeds_target_size()
     }
-
-    pub fn merge(
-        &self,
-        segments: &Vec<Arc<Segment>>,
-    ) -> io::Result<(Arc<SsTableLevel<PartitionedLevel>>, Vec<Arc<Segment>>)> {
-        self.inner.merge(segments)
-    }
 }
 
 impl SsTableLevel<PartitionedLevel> {
@@ -180,6 +162,13 @@ impl SsTableLevel<PartitionedLevel> {
             }
         }
         res
+    }
+
+    pub fn merge(
+        &self,
+        segments: &Vec<Arc<Segment>>,
+    ) -> io::Result<(Arc<SsTableLevel<PartitionedLevel>>, Vec<Arc<Segment>>)> {
+        self.inner.merge(segments)
     }
 }
 
