@@ -235,7 +235,11 @@ impl Segment {
                 segment_index_size += entry.key.len() as u64;
             }
             if file_size + segment_index_size > target_size {
+                let footer = SegmentFooter {
+                    index_offset: file_size,
+                };
                 buf_writer.write_all(&self.index.to_bytes())?;
+                buf_writer.write_all(&footer.to_bytes())?;
                 buf_writer.write_all(&MAGIC_BYTES)?;
                 break;
             }
