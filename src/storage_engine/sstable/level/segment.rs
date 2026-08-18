@@ -1,6 +1,6 @@
 use crate::storage_engine::memtable::MemTableValue;
 use crate::storage_engine::sstable::SsTableEntry;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
@@ -213,6 +213,44 @@ impl Segment {
         Ok(filepath)
     }
 
+    // TODO: these two writing functions almost do the same, can they be abstracted?
+    pub fn write_slice(
+        &mut self,
+        slice: &mut VecDeque<SsTableEntry>,
+        target_size: u64,
+        index_sparsity_factor: &u32,
+    ) -> io::Result<()> {
+        let mut file_size = self.file.metadata()?.size();
+        let mut buf_writer = BufWriter::new(&self.file);
+        let mut segment_index_size = self.index.size();
+        let mut counter: u32 = 0;
+        while let Some(entry) = slice.front() {
+            let offset = file_size;
+            let bytes = entry.to_bytes();
+            let entry_len = bytes.len() as u32;
+            file_size += entry_len as u64;
+            file_size += size_of::<u32>() as u64;
+            if counter % index_sparsity_factor == 0 {
+                segment_index_size += entry.key.len() as u64;
+                segment_index_size += entry.key.len() as u64;
+            }
+            if file_size + segment_index_size > target_size {
+                buf_writer.write_all(&self.index.to_bytes())?;
+                buf_writer.write_all(&MAGIC_BYTES)?;
+                break;
+            }
+            if counter % index_sparsity_factor == 0 {
+                self.index.add_index(entry.key.clone(), offset);
+            }
+            buf_writer.write_all(&entry_len.to_le_bytes())?;
+            buf_writer.write_all(&bytes)?;
+            counter += 1;
+            let _ = slice.pop_front();
+        }
+        buf_writer.flush()?;
+        Ok(())
+    }
+
     fn determine_segment_filename(sequence_number: &u64) -> String {
         let mut padding_bytes = Vec::<u8>::new();
         let level_number_str = String::from("00000000");
@@ -317,6 +355,15 @@ impl SegmentIndex {
             buf_offset += size_of::<u64>();
         }
         segment_index
+    }
+
+    fn size(&self) -> u64 {
+        let mut total_size: u64 = 0;
+        for idx in &self.indices {
+            total_size += idx.key.len() as u64;
+            total_size += size_of::<u64>() as u64;
+        }
+        total_size
     }
 }
 

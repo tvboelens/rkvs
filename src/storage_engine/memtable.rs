@@ -1041,6 +1041,8 @@ mod tests {
         assert!(matches!(res.value, Some(v) if v == String::from("value4")));
     }
     /*
-    TODO: corrupted WAL tests -> make sure that recovering twice is correct
+    TODO: corrupted WAL tests
+    1. Overwrite some bytes instead of truncating
+    2. In this case also recover twice
      */
 }

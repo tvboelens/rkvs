@@ -8,7 +8,7 @@ use std::sync::{Mutex, RwLock};
 mod compaction;
 pub mod level;
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 pub struct SsTableEntry {
     pub key: String,
     pub value: Option<String>,

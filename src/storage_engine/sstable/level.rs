@@ -1,6 +1,8 @@
 use super::SsTableEntry;
 pub use segment::Segment;
-use std::io;
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{self, BufWriter};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -118,7 +120,103 @@ impl PartitionedLevel {
         &self,
         _segments: &Vec<Arc<Segment>>,
     ) -> io::Result<(Arc<SsTableLevel<PartitionedLevel>>, Vec<Arc<Segment>>)> {
+        /*
+        1. Break up into "intervals" that each don't overlap
+        2. Then could do one thread per interval, I think here we could indeed spawn a thread
+        3. For each interval, read a range from each segment, merge in memory and then pass to BufWriter
+            1. So the relation is first compare by key and if equal, then compare by lsn. If equal take only the newest
+            2. The question then becomes how to determine the range
+                1. When we start, then simply take the first key of each segment
+                2. So lets say we have segment 0,...,n and vec 0,..,n with start_i and end_i
+                    1. Then sort until in some segment we hit a key that is larger then end_i for some i
+                    2. After we have inserted or discarded a key from a vec, also delete it (use VecDeque)
+                    3. Thus at start we must make sure that the vecs are large enough to contain the starts of the other vecs
+                    4. And apart from that could just take a target size and divide it by n
+                    5. What about this:
+                        1. Have target size and n segments
+                        2. Read approximately target size divided by n
+                        3. Then determine "smallest" end key
+                        4. When merging: if we write a key (or discard because equal but smaller lsn), then also delete it from vec
+                        5. Continue until first key of each vec is larger than the "smallest" end key we determined before
+                        6. Repeat
+                    6. On a first glance this should work, but have to think more carefully about this
+                    7. We also might want to think about the target size
+
+         */
         todo!()
+    }
+
+    fn merge_and_write_slices(
+        segment: &mut Segment,
+        mut slices: Vec<VecDeque<SsTableEntry>>,
+        buf_writer: &mut BufWriter<File>,
+    ) -> io::Result<Option<Vec<SsTableEntry>>> {
+        slices = slices
+            .into_iter()
+            .filter(|slice| !slice.is_empty())
+            .collect();
+        if slices.is_empty() {
+            return Ok(None);
+        }
+        let mut smallest_final_key = slices[0].back().unwrap().key.clone();
+        for slice in &slices {
+            match slice.back() {
+                None => {
+                    continue;
+                }
+                Some(entry) => {
+                    if entry.key < smallest_final_key {
+                        smallest_final_key = entry.key.clone();
+                    }
+                }
+            }
+        }
+        let mut candidate_slices: Vec<&mut VecDeque<SsTableEntry>> = slices
+            .iter_mut()
+            .filter(|slice| slice.front().unwrap().key <= smallest_final_key)
+            .collect();
+        let mut slice_to_write = VecDeque::<SsTableEntry>::new();
+        while !candidate_slices.is_empty() {
+            /*
+            1. iterate over slices to determine which entry to write
+            2. Then have to iterate again to determine which to remove
+            3. Alternatively could save the indices
+             */
+            let mut slices_to_remove: Vec<usize> = Vec::new();
+            let mut slices_containing_key: Vec<usize> = Vec::new();
+            let mut curr_entry = candidate_slices[0].front().unwrap();
+            slices_containing_key.push(0);
+            for idx in 0..candidate_slices.len() {
+                let candidate_entry = candidate_slices[idx].front().unwrap();
+                if candidate_entry.key < curr_entry.key {
+                    slices_containing_key.clear();
+                    slices_containing_key.push(idx);
+                    curr_entry = candidate_entry;
+                } else if candidate_entry.key == curr_entry.key {
+                    slices_containing_key.push(idx);
+                    if curr_entry.sequence_number < candidate_entry.sequence_number {
+                        curr_entry = candidate_entry;
+                    }
+                }
+            }
+            slice_to_write.push_back(curr_entry.clone());
+            for idx in slices_containing_key {
+                let _ = candidate_slices[idx].pop_front();
+                if candidate_slices[idx].is_empty()
+                    || candidate_slices[idx]
+                        .front()
+                        .is_some_and(|entry| entry.key > smallest_final_key)
+                {
+                    slices_to_remove.push(idx);
+                }
+            }
+            slices_to_remove.sort();
+            slices_to_remove.reverse();
+            for idx in slices_to_remove {
+                candidate_slices.remove(idx);
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -194,9 +292,11 @@ impl Clone for SsTableLevel<OverlappingLevel> {
     }
 }
 
-/* #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage_engine::memtable::MemTableValue;
+    use std::collections::HashMap;
     use std::fs::{self, DirBuilder};
     use std::path::PathBuf;
 
@@ -216,7 +316,106 @@ mod tests {
             let _ = fs::remove_dir_all(&self.dir);
         }
     }
-} */
+
+    #[test]
+    fn merge_two_non_overlapping_segments() {
+        let dir = PathBuf::from("./sstable_merge_two_non_overlapping_segments");
+        let cl = Cleanup { dir: dir.clone() };
+        assert!(cl.setup().is_ok());
+        let mut table = HashMap::new();
+        let kv_pairs1 = vec![
+            (
+                String::from("key1"),
+                MemTableValue {
+                    value: Some(String::from("value1")),
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("key2"),
+                MemTableValue {
+                    value: Some(String::from("value2")),
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("key3"),
+                MemTableValue {
+                    value: Some(String::from("value3")),
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("key4"),
+                MemTableValue {
+                    value: Some(String::from("value4")),
+                    sequence_number: 2,
+                },
+            ),
+        ];
+        for (key, value) in &kv_pairs1 {
+            table.insert(key.clone(), value.clone());
+        }
+        let sequence_number = 0;
+        let sparsity_factor = 1;
+        let fp =
+            Segment::write_segment_file(&dir, &table, &sequence_number, &sparsity_factor).unwrap();
+        let segment1 = Segment::from_file(fp).unwrap();
+        table.clear();
+        let kv_pairs2 = vec![
+            (
+                String::from("key5"),
+                MemTableValue {
+                    value: Some(String::from("value5")),
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("key6"),
+                MemTableValue {
+                    value: Some(String::from("value6")),
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("key7"),
+                MemTableValue {
+                    value: Some(String::from("value7")),
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("key8"),
+                MemTableValue {
+                    value: Some(String::from("value8")),
+                    sequence_number: 2,
+                },
+            ),
+        ];
+        for (key, value) in &kv_pairs1 {
+            table.insert(key.clone(), value.clone());
+        }
+        let sequence_number = 2;
+        let sparsity_factor = 1;
+        let fp =
+            Segment::write_segment_file(&dir, &table, &sequence_number, &sparsity_factor).unwrap();
+        let segment2 = Segment::from_file(fp).unwrap();
+        let level = Arc::new(SsTableLevel::<PartitionedLevel>::new(0, 0));
+        let segments = vec![Arc::new(segment1), Arc::new(segment2)];
+        let (new_level, segments_to_delete) = level.merge(&segments).unwrap();
+        assert!(segments_to_delete.is_empty());
+        for (key, value) in kv_pairs1 {
+            let entry = SsTableEntry::from(key.clone(), value);
+            let read_entry = new_level.get(&key).unwrap().unwrap();
+            assert_eq!(entry, read_entry);
+        }
+        for (key, value) in kv_pairs2 {
+            let entry = SsTableEntry::from(key.clone(), value);
+            let read_entry = new_level.get(&key).unwrap().unwrap();
+            assert_eq!(entry, read_entry);
+        }
+    }
+}
 
 /*
 TODO:
