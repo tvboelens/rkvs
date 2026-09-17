@@ -1,11 +1,11 @@
 use std::{collections::HashMap, io, path::PathBuf, sync::Arc};
 
 use crate::storage_engine::memtable::MemTableValue;
-use crate::storage_engine::sstable::{SsTable, level::Segment};
+use crate::storage_engine::sstable::SsTable;
+use crate::storage_engine::sstable::level::segment::SegmentWriter;
 
 pub trait MemTableFlush {
-    fn flush(&self, table: &HashMap<String, MemTableValue>, sequence_number: u64)
-    -> io::Result<()>;
+    fn flush(&self, table: &HashMap<String, MemTableValue>) -> io::Result<()>;
 }
 
 pub struct Flusher {
@@ -25,15 +25,11 @@ impl Flusher {
 }
 
 impl MemTableFlush for Flusher {
-    fn flush(
-        &self,
-        table: &HashMap<String, MemTableValue>,
-        sequence_number: u64,
-    ) -> io::Result<()> {
-        let fp = Segment::write_segment_file(
+    fn flush(&self, table: &HashMap<String, MemTableValue>) -> io::Result<()> {
+        let fp = SegmentWriter::write_segment_file(
             &self.dir,
             table,
-            &sequence_number,
+            &(self.sstable.highest_segment_number(&0) + 1),
             &self.index_sparsity_factor,
         )?;
         self.sstable.find_and_add_segment(fp)

@@ -15,6 +15,9 @@ struct CompactionBt {
 }
 
 impl CompactionBt {
+    /// Compaction starting at level 0, that is the first merge is from level 0 into level 1.
+    /// This method will successively merge into higher levels until a merge is completed
+    /// and the resulting level does not exceed target size.
     fn compact_from_level_zero(&mut self) -> io::Result<Vec<Arc<SsTableLevel<PartitionedLevel>>>> {
         let level_zero: Arc<SsTableLevel<OverlappingLevel>>;
         let mut partitioned_levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>;
@@ -28,7 +31,7 @@ impl CompactionBt {
         let mut new_partitioned_level: Arc<SsTableLevel<PartitionedLevel>>;
         let mut segments_to_merge = level_zero.segments_to_merge();
         let mut segments_to_delete: Vec<Arc<Segment>>;
-        let mut level_number = 1;
+        let mut level_number = 1; // TODO: is this the right way to do it?
         loop {
             match partitioned_levels.first() {
                 Some(level) => {
@@ -40,10 +43,7 @@ impl CompactionBt {
                     let _ = partitioned_levels.remove(0); // TODO: maybe VecDeque is better for this purpose
                 }
                 None => {
-                    let level = Arc::new(SsTableLevel::<PartitionedLevel>::new(
-                        0,
-                        level_number.clone(),
-                    ));
+                    let level = Arc::new(SsTableLevel::<PartitionedLevel>::new(0, level_number));
                     // maybe do a match here to clean up if error?
                     (new_partitioned_level, segments_to_delete) =
                         level.merge(&segments_to_merge)?;
@@ -61,6 +61,11 @@ impl CompactionBt {
         Ok(new_partitioned_levels)
     }
 
+    /// Compaction starting at a higher level.
+    /// This method will successively merge into higher levels until a merge is completed
+    /// and the resulting level does not exceed target size.
+    /// In theory this method should never be called, but it might be necessary if an
+    /// older compaction failed.
     fn compact_from_partitioned_level(
         &mut self,
         mut levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>,
@@ -72,7 +77,6 @@ impl CompactionBt {
         let mut new_partitioned_levels = Vec::new();
         let mut new_partitioned_level: Arc<SsTableLevel<PartitionedLevel>>;
         let mut segments_to_delete: Vec<Arc<Segment>>;
-        let mut level_number = levels.first().unwrap().highest_sequence_no() + 1;
         let _ = levels.remove(0);
         loop {
             match levels.first() {
@@ -85,7 +89,7 @@ impl CompactionBt {
                     let _ = levels.remove(0); // TODO: maybe VecDeque is better for this purpose
                 }
                 None => {
-                    let level = Arc::new(SsTableLevel::<PartitionedLevel>::new(0, level_number));
+                    let level = Arc::new(SsTableLevel::<PartitionedLevel>::new(0, 0));
                     // maybe do a match here to clean up if error?
                     (new_partitioned_level, segments_to_delete) =
                         level.merge(&segments_to_merge)?;
@@ -93,7 +97,6 @@ impl CompactionBt {
                     new_partitioned_levels.push(new_partitioned_level.clone());
                 }
             }
-            level_number += 1;
             if !new_partitioned_level.exceeds_target_size() {
                 break;
             }
@@ -103,6 +106,10 @@ impl CompactionBt {
         Ok(new_partitioned_levels)
     }
 
+    /// Checks if there are any higher levels that need to be compacted.
+    /// The first element of the returned tuple consists of the segments
+    /// that do not need to be compacted, the second element of the segments
+    /// that do need to be compacted.
     fn find_partitioned_levels_to_compact(
         &self,
     ) -> (
@@ -131,6 +138,8 @@ impl CompactionBt {
         }
     }
 
+    /// Finds all segment files which are not being read anymore, hence are safe
+    /// for deletion and executes the deletion.
     fn remove_segment_files(&mut self) {
         let mut indices = Vec::new();
         let mut files = Vec::new();
@@ -142,6 +151,7 @@ impl CompactionBt {
                 files.push(self.segments_to_delete[i].filepath());
             }
         }
+        // reverse so that remove() does not invalidate other indices
         indices.reverse();
         for idx in indices {
             self.segments_to_delete.remove(idx);

@@ -1,5 +1,6 @@
 use crate::storage_engine::memtable::MemTableValue;
 use level::{LevelContainer, OverlappingLevel, PartitionedLevel, SsTableLevel};
+use std::collections::VecDeque;
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar};
@@ -67,6 +68,39 @@ impl SsTable {
         }
         Ok(())
     }
+
+    pub fn highest_segment_number(&self, level_number: &u64) -> u64 {
+        let lock = self.inner.read().unwrap();
+        if *level_number == 0 {
+            lock.level_zero().highest_segment_number()
+        } else {
+            let levels = lock.partitioned_levels();
+            levels[(level_number - 1) as usize].highest_segment_number()
+        }
+    }
+
+    pub fn highest_sequence_number(&self) -> u64 {
+        let level_zero: Arc<SsTableLevel<OverlappingLevel>>;
+        let higher_levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>;
+        {
+            let lock = self.inner.read().unwrap();
+            level_zero = lock.level_zero();
+            higher_levels = lock.partitioned_levels();
+        }
+
+        let mut res = 0;
+        let segment_no = level_zero.highest_sequence_no();
+        if segment_no > res {
+            res = segment_no
+        }
+        for level in &higher_levels {
+            let num = level.highest_sequence_no();
+            if num > res {
+                res = num;
+            }
+        }
+        res
+    }
 }
 
 impl SsTableEntry {
@@ -101,7 +135,7 @@ impl SsTableEntry {
         buf
     }
 
-    fn from_bytes(bytes: &Vec<u8>) -> Self {
+    fn from_bytes(bytes: &[u8]) -> Self {
         let mut offset: usize = 0;
         let mut u32_buf: [u8; size_of::<u32>()] = [0, 0, 0, 0];
         u32_buf.copy_from_slice(&bytes[offset..offset + size_of::<u32>()]);
@@ -154,6 +188,25 @@ impl SsTableEntry {
             value: value.value,
             sequence_number: value.sequence_number,
         }
+    }
+
+    pub fn deque_from_bytes(bytes: &Vec<u8>) -> VecDeque<Self> {
+        let mut res = VecDeque::new();
+        let mut offset: usize = 0;
+        while offset + size_of::<u32>() < bytes.len() {
+            let mut u32_buf: [u8; size_of::<u32>()] = [0, 0, 0, 0];
+            u32_buf.copy_from_slice(&bytes[offset..offset + size_of::<u32>()]);
+            let entry_size = u32::from_le_bytes(u32_buf) as usize;
+            if offset + entry_size < bytes.len() {
+                res.push_back(SsTableEntry::from_bytes(
+                    &bytes[offset..offset + entry_size].to_vec(),
+                ));
+                offset += entry_size;
+            } else {
+                break;
+            }
+        }
+        res
     }
 }
 

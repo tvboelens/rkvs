@@ -395,7 +395,7 @@ where
         while let Ok(job) = self.receiver.recv() {
             if self.current_size >= self.max_size {
                 let mut lock = self.table.write().unwrap();
-                match self.flusher.flush(&*lock, self.wal.next_sequence_number()) {
+                match self.flusher.flush(&*lock) {
                     Ok(_) => {
                         self.current_size = 0;
                         lock.clear();
@@ -445,7 +445,7 @@ mod tests {
     struct FakeFlusher {}
 
     impl MemTableFlush for FakeFlusher {
-        fn flush(&self, _: &HashMap<String, MemTableValue>, _: u64) -> io::Result<()> {
+        fn flush(&self, _: &HashMap<String, MemTableValue>) -> io::Result<()> {
             Ok(())
         }
     }

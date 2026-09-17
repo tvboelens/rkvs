@@ -109,7 +109,7 @@ impl Store for StorageEngine {
 impl StorageEngine {
     pub fn new(config: StorageEngineConf) -> io::Result<Self> {
         let sstable = SsTable::start()?; // TODO: sstable also needs to know about the dir
-        let sstable_ptr = Arc::new(sstable);
+        let sstable_ptr = Arc::new(sstable); // TODO: recover
         let flusher = Flusher::from(
             sstable_ptr.clone(),
             config.dir.clone(),
@@ -118,7 +118,7 @@ impl StorageEngine {
         let memtable = memtable::MemTable::start(
             config.dir.join("WAL"),
             config.segment_size,
-            0,
+            sstable_ptr.highest_sequence_number(),
             config.memtable_max_size,
             flusher,
         )?;

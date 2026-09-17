@@ -9,6 +9,18 @@ use std::path::PathBuf;
 static MAGIC_BYTES: [u8; 4] = [0x72, 0x6B, 0x76, 0x73]; //rkvs
 static SEGMENT_FOOTER_LEN: u64 = 12; // magic bytes 4, index offset 8
 
+/*
+TODO: Segment needs to also refer to the level
+Probably easiest to put it in the filename
+
+Idea: separate writer/creator
+1. I think the easiest is to have a writer struct
+2. This internally holds the file
+3.
+*/
+/// Segment of an SSTable level. This struct provides the interface to read entries from disk.
+/// It is read-only, for writing the SegmentWriter struct is used. It also gives access
+/// to metadata and internally stores the index in memory.
 pub struct Segment {
     file: File,
     filepath: PathBuf,
@@ -16,9 +28,18 @@ pub struct Segment {
     highest_sequence_no: u64,
     size: u64,
     data_block_end: u64,
-    number: u64,
+    number: u64, // Higher number means newer segment
     first_key: String,
     last_key: String,
+}
+
+/// Utility struct to create and write to SSTable segments.
+/// It is used when flushing the memtable to disk as well
+/// during compaction, i.e. when merging segments.
+pub struct SegmentWriter {
+    file: File,
+    filepath: PathBuf,
+    curr_size: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -114,12 +135,36 @@ impl Segment {
         }
     }
 
+    pub fn read_at_most(
+        &self,
+        offset: &u64,
+        max_bytes: &u64,
+    ) -> io::Result<VecDeque<SsTableEntry>> {
+        let mut entry_buf = Vec::<u8>::new();
+        entry_buf.resize(*max_bytes as usize, 0);
+        let mut bytes_read = 0;
+        let mut buf_offset = 0;
+        let mut curr_offset = offset.clone();
+        while bytes_read < *max_bytes as usize {
+            bytes_read += self
+                .file
+                .read_at(&mut entry_buf[buf_offset..], curr_offset.clone())?;
+            buf_offset += bytes_read;
+            curr_offset += bytes_read as u64;
+        }
+        Ok(SsTableEntry::deque_from_bytes(&entry_buf))
+    }
+
     pub fn first_key(&self) -> &String {
         &self.first_key
     }
 
     pub fn last_key(&self) -> &String {
         &self.last_key
+    }
+
+    pub fn segment_number(&self) -> &u64 {
+        &self.number
     }
 
     fn read_table_entries(file: &File, start: u64, end: u64) -> io::Result<Vec<SsTableEntry>> {
@@ -172,13 +217,90 @@ impl Segment {
         self.filepath.clone()
     }
 
+    pub fn overlaps(&self, other: &Segment) -> bool {
+        other.first_key <= self.last_key && self.first_key <= other.last_key
+    }
+
+    // TODO: these two writing functions almost do the same, can they be abstracted?
+    pub fn write_slice(
+        &mut self,
+        slice: &mut VecDeque<SsTableEntry>,
+        target_size: &u64,
+        index_sparsity_factor: u32,
+    ) -> io::Result<()> {
+        let mut file_size = self.file.metadata()?.size();
+        let mut buf_writer = BufWriter::new(&self.file);
+        let mut segment_index_size = self.index.size();
+        let mut counter: u32 = 0;
+        while let Some(entry) = slice.front() {
+            let offset = file_size;
+            let bytes = entry.to_bytes();
+            let entry_len = bytes.len() as u32;
+            file_size += entry_len as u64;
+            file_size += size_of::<u32>() as u64;
+            if counter % index_sparsity_factor == 0 {
+                segment_index_size += entry.key.len() as u64;
+                segment_index_size += entry.key.len() as u64;
+            }
+            if file_size + segment_index_size + MAGIC_BYTES.len() as u64 + SEGMENT_FOOTER_LEN
+                > *target_size
+            {
+                let footer = SegmentFooter {
+                    index_offset: file_size,
+                };
+                buf_writer.write_all(&self.index.to_bytes())?;
+                buf_writer.write_all(&footer.to_bytes())?;
+                buf_writer.write_all(&MAGIC_BYTES)?;
+                break;
+            }
+            if counter % index_sparsity_factor == 0 {
+                self.index.add_index(entry.key.clone(), offset);
+            }
+            buf_writer.write_all(&entry_len.to_le_bytes())?;
+            buf_writer.write_all(&bytes)?;
+            counter += 1;
+            let _ = slice.pop_front();
+        }
+        buf_writer.flush()?;
+        Ok(())
+    }
+
+    fn determine_segment_filename(level_number: &u64, segment_number: &u64) -> String {
+        let mut padding_bytes = Vec::<u8>::new();
+        let mut level_number_hex_str = format!("{:x}", level_number);
+        padding_bytes.resize(8 - level_number_hex_str.len(), 48); // "0" = 0x30 = 48
+        level_number_hex_str.insert_str(0, &String::from_utf8(padding_bytes.clone()).unwrap());
+        let mut segment_number_hex_str = format!("{:x}", segment_number);
+        padding_bytes.resize(8 - segment_number_hex_str.len(), 48); // "0" = 0x30 = 48
+        segment_number_hex_str.insert_str(0, &String::from_utf8(padding_bytes).unwrap());
+        level_number_hex_str + &segment_number_hex_str + ".sst"
+    }
+
+    fn parse_entries(buf: Vec<u8>) -> Vec<SsTableEntry> {
+        let mut res = Vec::new();
+        let mut offset: usize = 0;
+        let mut u32_buf: [u8; size_of::<u32>()] = [0, 0, 0, 0];
+        while offset < buf.len() {
+            u32_buf.copy_from_slice(&buf[offset..offset + size_of::<u32>()]);
+            let record_len = u32::from_le_bytes(u32_buf);
+            offset += size_of::<u32>();
+            res.push(SsTableEntry::from_bytes(
+                &buf[offset..offset + record_len as usize].to_vec(),
+            ));
+            offset += record_len as usize;
+        }
+        res
+    }
+}
+
+impl SegmentWriter {
     pub fn write_segment_file(
         dir: &PathBuf,
         table: &HashMap<String, MemTableValue>,
-        sequence_number: &u64,
+        segment_number: &u64,
         index_sparsity_factor: &u32,
     ) -> io::Result<PathBuf> {
-        let filename = Segment::determine_segment_filename(sequence_number);
+        let filename = Segment::determine_segment_filename(&0, segment_number);
         let filepath = dir.join(filename);
         let file = OpenOptions::new()
             .write(true)
@@ -213,72 +335,30 @@ impl Segment {
         Ok(filepath)
     }
 
-    // TODO: these two writing functions almost do the same, can they be abstracted?
-    pub fn write_slice(
-        &mut self,
-        slice: &mut VecDeque<SsTableEntry>,
-        target_size: u64,
-        index_sparsity_factor: &u32,
-    ) -> io::Result<()> {
-        let mut file_size = self.file.metadata()?.size();
-        let mut buf_writer = BufWriter::new(&self.file);
-        let mut segment_index_size = self.index.size();
-        let mut counter: u32 = 0;
-        while let Some(entry) = slice.front() {
-            let offset = file_size;
-            let bytes = entry.to_bytes();
-            let entry_len = bytes.len() as u32;
-            file_size += entry_len as u64;
-            file_size += size_of::<u32>() as u64;
-            if counter % index_sparsity_factor == 0 {
-                segment_index_size += entry.key.len() as u64;
-                segment_index_size += entry.key.len() as u64;
-            }
-            if file_size + segment_index_size > target_size {
-                let footer = SegmentFooter {
-                    index_offset: file_size,
-                };
-                buf_writer.write_all(&self.index.to_bytes())?;
-                buf_writer.write_all(&footer.to_bytes())?;
-                buf_writer.write_all(&MAGIC_BYTES)?;
-                break;
-            }
-            if counter % index_sparsity_factor == 0 {
-                self.index.add_index(entry.key.clone(), offset);
-            }
-            buf_writer.write_all(&entry_len.to_le_bytes())?;
-            buf_writer.write_all(&bytes)?;
-            counter += 1;
-            let _ = slice.pop_front();
-        }
-        buf_writer.flush()?;
-        Ok(())
+    pub fn create_new_segment(
+        dir: &PathBuf,
+        level_number: &u64,
+        segment_number: &u64,
+    ) -> io::Result<Self> {
+        let filename = Segment::determine_segment_filename(level_number, segment_number);
+        let filepath = dir.join(filename);
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .open(filepath.clone())?;
+        let size = file.metadata()?.size();
+        Ok(SegmentWriter {
+            file: file,
+            filepath: filepath,
+            curr_size: size,
+        })
     }
 
-    fn determine_segment_filename(sequence_number: &u64) -> String {
-        let mut padding_bytes = Vec::<u8>::new();
-        let level_number_str = String::from("00000000");
-        let mut sequence_number_hex_str = format!("{:x}", sequence_number);
-        padding_bytes.resize(8 - sequence_number_hex_str.len(), 48); // "0" = 0x30 = 48
-        sequence_number_hex_str.insert_str(0, &String::from_utf8(padding_bytes).unwrap());
-        level_number_str + &sequence_number_hex_str + ".sst"
+    pub fn filepath(&self) -> &PathBuf {
+        &self.filepath
     }
 
-    fn parse_entries(buf: Vec<u8>) -> Vec<SsTableEntry> {
-        let mut res = Vec::new();
-        let mut offset: usize = 0;
-        let mut u32_buf: [u8; size_of::<u32>()] = [0, 0, 0, 0];
-        while offset < buf.len() {
-            u32_buf.copy_from_slice(&buf[offset..offset + size_of::<u32>()]);
-            let record_len = u32::from_le_bytes(u32_buf);
-            offset += size_of::<u32>();
-            res.push(SsTableEntry::from_bytes(
-                &buf[offset..offset + record_len as usize].to_vec(),
-            ));
-            offset += record_len as usize;
-        }
-        res
-    }
+    //pub fn
 }
 
 impl SegmentIndex {
@@ -564,7 +644,8 @@ mod tests {
         let sequence_number = 0;
         let sparsity_factor = 1;
         let fp =
-            Segment::write_segment_file(&dir, &table, &sequence_number, &sparsity_factor).unwrap();
+            SegmentWriter::write_segment_file(&dir, &table, &sequence_number, &sparsity_factor)
+                .unwrap();
         let segment = Segment::from_file(fp).unwrap();
         assert_eq!(segment.first_key, String::from("key"));
         assert_eq!(segment.last_key, String::from("key"));
@@ -630,7 +711,8 @@ mod tests {
         let sequence_number = 0;
         let sparsity_factor = 1;
         let fp =
-            Segment::write_segment_file(&dir, &table, &sequence_number, &sparsity_factor).unwrap();
+            SegmentWriter::write_segment_file(&dir, &table, &sequence_number, &sparsity_factor)
+                .unwrap();
         let segment = Segment::from_file(fp).unwrap();
         assert_eq!(segment.first_key, String::from("first_key"));
         assert_eq!(segment.last_key, String::from("third_key"));
@@ -735,7 +817,8 @@ mod tests {
         let sequence_number = 0;
         let sparsity_factor = 4;
         let fp =
-            Segment::write_segment_file(&dir, &table, &sequence_number, &sparsity_factor).unwrap();
+            SegmentWriter::write_segment_file(&dir, &table, &sequence_number, &sparsity_factor)
+                .unwrap();
         let segment = Segment::from_file(fp).unwrap();
         assert_eq!(segment.first_key, String::from("eighth_key"));
         assert_eq!(segment.last_key, String::from("third_key"));
