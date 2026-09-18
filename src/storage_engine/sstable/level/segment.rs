@@ -195,9 +195,13 @@ impl Segment {
         let mut buf_offset: usize = 0;
         let mut bytes_read: usize = 0;
         while bytes_read < buf.len() {
-            bytes_read += file.read_at(&mut buf[buf_offset..], curr_offset.clone())?;
+            let curr_bytes_read = file.read_at(&mut buf[buf_offset..], curr_offset.clone())?;
+            bytes_read += curr_bytes_read;
             buf_offset += bytes_read;
             curr_offset += bytes_read as u64;
+            if curr_bytes_read == 0 {
+                break;
+            }
         }
         Ok(Segment::parse_entries(buf))
     }
@@ -208,9 +212,13 @@ impl Segment {
         let mut u32_buf: [u8; size_of::<u32>()] = [0, 0, 0, 0];
         let mut bytes_read: usize = 0;
         while bytes_read < size_of::<u32>() {
-            bytes_read += file.read_at(&mut u32_buf[buf_offset..], curr_offset.clone())?;
+            let curr_bytes_read = file.read_at(&mut u32_buf[buf_offset..], curr_offset.clone())?;
+            bytes_read += curr_bytes_read;
             buf_offset += bytes_read;
             curr_offset += bytes_read as u64;
+            if curr_bytes_read == 0 {
+                break;
+            }
         }
         let entry_len = u32::from_le_bytes(u32_buf.clone());
         let mut entry_buf = Vec::<u8>::new();
@@ -218,9 +226,14 @@ impl Segment {
         bytes_read = 0;
         buf_offset = 0;
         while bytes_read < entry_len as usize {
-            bytes_read += file.read_at(&mut entry_buf[buf_offset..], curr_offset.clone())?;
+            let curr_bytes_read =
+                file.read_at(&mut entry_buf[buf_offset..], curr_offset.clone())?;
+            bytes_read += curr_bytes_read;
             buf_offset += bytes_read;
             curr_offset += bytes_read as u64;
+            if curr_bytes_read == 0 {
+                break;
+            }
         }
 
         Ok(SsTableEntry::from_bytes(&entry_buf))
