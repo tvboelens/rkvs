@@ -197,9 +197,10 @@ impl SsTableEntry {
             let mut u32_buf: [u8; size_of::<u32>()] = [0, 0, 0, 0];
             u32_buf.copy_from_slice(&bytes[offset..offset + size_of::<u32>()]);
             let entry_size = u32::from_le_bytes(u32_buf) as usize;
+            offset += size_of::<u32>();
             if offset + entry_size < bytes.len() {
                 res.push_back(SsTableEntry::from_bytes(
-                    &bytes[offset..offset + entry_size].to_vec(),
+                    &bytes[offset..offset + entry_size],
                 ));
                 offset += entry_size;
             } else {

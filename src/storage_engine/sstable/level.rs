@@ -3,12 +3,10 @@ use crate::storage_engine::sstable::level::segment::SegmentWriter;
 use super::SsTableEntry;
 pub use segment::Segment;
 use std::collections::{HashMap, VecDeque};
-use std::fs::File;
-use std::io::{self, BufWriter};
+use std::io::{self};
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio_util::bytes::buf;
 
 pub mod segment;
 
@@ -92,8 +90,27 @@ impl LevelContainer {
 }
 
 impl SstLevel for OverlappingLevel {
-    fn get(&self, _key: &String) -> io::Result<Option<SsTableEntry>> {
-        todo!()
+    /// Searches all the segments in the level for the entry.
+    /// If multiple entries are found with the key, returns the
+    /// newest entry, i.e. the one with the highest sequence number.
+    fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>> {
+        let mut curr_entry = None;
+        for segment in &self.segments {
+            curr_entry = match segment.get(key)? {
+                None => curr_entry,
+                Some(entry) => match curr_entry {
+                    None => Some(entry),
+                    Some(curr_e) => {
+                        if curr_e.sequence_number > entry.sequence_number {
+                            Some(curr_e)
+                        } else {
+                            Some(entry)
+                        }
+                    }
+                },
+            };
+        }
+        Ok(curr_entry)
     }
 
     fn segments_to_merge(&self) -> Vec<Arc<Segment>> {
@@ -214,7 +231,6 @@ impl PartitionedLevel {
         let read_buf_len = (MERGE_BUF_MAX_TOTAL_SIZE / segments.len() as u64) + 1;
         let mut res = Vec::new();
         let mut read_bufs: Vec<SegmentReadBuf> = Vec::new();
-        let mut write_buf: VecDeque<SsTableEntry> = VecDeque::new();
         for segment in segments {
             read_bufs.push(SegmentReadBuf {
                 segment: segment.clone(),
@@ -224,7 +240,6 @@ impl PartitionedLevel {
                 max_size: read_buf_len,
             });
         }
-
         let mut new_segment_number = self.highest_segment_number() + 1;
         let dir: PathBuf = segments
             .first()
@@ -233,18 +248,13 @@ impl PartitionedLevel {
             .parent()
             .unwrap()
             .into();
-        let mut segment_writer =
-            SegmentWriter::create_new_segment(&dir, &self.level_number, &new_segment_number)?;
-        //new_segment_number += 1;
-        /*
-        1. Fill the read bufs (before starting loop)
-        2. Discard empty read bufs
-        3. merge into write buf
-        4. while write buf not empty
-            1. write
-            2. If segment full, create new
-        6. fill read bufs -> go to 2.
-         */
+        let mut segment_writer = SegmentWriter::create_new_segment(
+            &dir,
+            &self.level_number,
+            &new_segment_number,
+            self.index_sparsity_factor.deref().clone(),
+        )?;
+        new_segment_number += 1;
         for buf in &mut read_bufs {
             buf.fill()?
         }
@@ -261,13 +271,27 @@ impl PartitionedLevel {
                 idx += 1;
             }
             let mut write_buf = merge_sort(&mut read_buf_refs);
-            while !write_buf.is_empty() {
-                todo!()
+            while let Some(entry) = write_buf.pop_front() {
+                if segment_writer.reached_target_size() {
+                    segment_writer.write_index_and_footer()?;
+                    let new_segment = Segment::from_file(segment_writer.filepath().clone())?;
+                    res.push(Arc::new(new_segment));
+                    segment_writer = SegmentWriter::create_new_segment(
+                        &dir,
+                        &self.level_number,
+                        &new_segment_number,
+                        self.index_sparsity_factor.deref().clone(),
+                    )?;
+                    new_segment_number += 1;
+                }
+                segment_writer.write_entry(&entry)?;
             }
-
             for buf in &mut read_bufs {
                 buf.fill()?
             }
+
+            // If a read buffer is still empty after filling,
+            // it has reached the end of the segment, so it can be discarded
             read_bufs = read_bufs
                 .into_iter()
                 .filter(|buf| !buf.is_empty())
@@ -621,7 +645,7 @@ mod tests {
                 String::from("key1"),
                 MemTableValue {
                     value: Some(String::from("value1")),
-                    sequence_number: 2,
+                    sequence_number: 1,
                 },
             ),
             (
@@ -635,14 +659,14 @@ mod tests {
                 String::from("key3"),
                 MemTableValue {
                     value: Some(String::from("value3")),
-                    sequence_number: 2,
+                    sequence_number: 3,
                 },
             ),
             (
                 String::from("key4"),
                 MemTableValue {
                     value: Some(String::from("value4")),
-                    sequence_number: 2,
+                    sequence_number: 4,
                 },
             ),
         ];
@@ -651,9 +675,13 @@ mod tests {
         }
         let sequence_number = 0;
         let sparsity_factor = 1;
-        let fp =
-            SegmentWriter::write_segment_file(&dir, &table, &sequence_number, &sparsity_factor)
-                .unwrap();
+        let fp = SegmentWriter::segment_file_from_memtable(
+            &dir,
+            &table,
+            &sequence_number,
+            &sparsity_factor,
+        )
+        .unwrap();
         let segment1 = Segment::from_file(fp).unwrap();
         table.clear();
         let kv_pairs2 = vec![
@@ -661,28 +689,28 @@ mod tests {
                 String::from("key5"),
                 MemTableValue {
                     value: Some(String::from("value5")),
-                    sequence_number: 2,
+                    sequence_number: 5,
                 },
             ),
             (
                 String::from("key6"),
                 MemTableValue {
                     value: Some(String::from("value6")),
-                    sequence_number: 2,
+                    sequence_number: 6,
                 },
             ),
             (
                 String::from("key7"),
                 MemTableValue {
                     value: Some(String::from("value7")),
-                    sequence_number: 2,
+                    sequence_number: 7,
                 },
             ),
             (
                 String::from("key8"),
                 MemTableValue {
                     value: Some(String::from("value8")),
-                    sequence_number: 2,
+                    sequence_number: 8,
                 },
             ),
         ];
@@ -691,11 +719,15 @@ mod tests {
         }
         let sequence_number = 2;
         let sparsity_factor = 1;
-        let fp =
-            SegmentWriter::write_segment_file(&dir, &table, &sequence_number, &sparsity_factor)
-                .unwrap();
+        let fp = SegmentWriter::segment_file_from_memtable(
+            &dir,
+            &table,
+            &sequence_number,
+            &sparsity_factor,
+        )
+        .unwrap();
         let segment2 = Segment::from_file(fp).unwrap();
-        let level = Arc::new(SsTableLevel::<PartitionedLevel>::new(0, 1));
+        let level = Arc::new(SsTableLevel::<PartitionedLevel>::new(1024, 1));
         let segments = vec![Arc::new(segment1), Arc::new(segment2)];
         let (new_level, segments_to_delete) = level.merge(&segments).unwrap();
         assert!(segments_to_delete.is_empty());

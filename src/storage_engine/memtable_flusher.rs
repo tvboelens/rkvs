@@ -26,7 +26,7 @@ impl Flusher {
 
 impl MemTableFlush for Flusher {
     fn flush(&self, table: &HashMap<String, MemTableValue>) -> io::Result<()> {
-        let fp = SegmentWriter::write_segment_file(
+        let fp = SegmentWriter::segment_file_from_memtable(
             &self.dir,
             table,
             &(self.sstable.highest_segment_number(&0) + 1),
