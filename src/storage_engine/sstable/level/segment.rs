@@ -5,6 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 static MAGIC_BYTES: [u8; 4] = [0x72, 0x6B, 0x76, 0x73]; //rkvs
 static SEGMENT_FOOTER_LEN: u64 = 12; // magic bytes 4, index offset 8
@@ -45,6 +46,14 @@ pub struct SegmentWriter {
     index: SegmentIndex,
     target_size: u64,
     entries_written: u64,
+}
+
+pub struct SegmentReadBuf {
+    segment: Arc<Segment>,
+    buf: VecDeque<SsTableEntry>,
+    curr_offset: u64,
+    size: u64,
+    max_size: u64,
 }
 
 #[derive(Debug, PartialEq)]
@@ -146,11 +155,13 @@ impl Segment {
         max_bytes: &u64,
     ) -> io::Result<VecDeque<SsTableEntry>> {
         let mut entry_buf = Vec::<u8>::new();
-        entry_buf.resize(*max_bytes as usize, 0);
+        // Only read until the end of the data block
+        let bytes_to_read: u64 = std::cmp::min(self.data_block_end - offset + 1, *max_bytes);
+        entry_buf.resize(bytes_to_read as usize, 0);
         let mut total_bytes_read = 0;
         let mut buf_offset = 0;
         let mut curr_offset = offset.clone();
-        while total_bytes_read < *max_bytes as usize {
+        while total_bytes_read < bytes_to_read as usize {
             let bytes_read = self
                 .file
                 .read_at(&mut entry_buf[buf_offset..], curr_offset.clone())?;
@@ -545,8 +556,54 @@ impl SegmentFooter {
     }
 }
 
+impl SegmentReadBuf {
+    pub fn new(segment: Arc<Segment>, read_buf_len: u64) -> Self {
+        SegmentReadBuf {
+            segment: segment,
+            buf: VecDeque::new(),
+            curr_offset: 0,
+            size: 0,
+            max_size: read_buf_len,
+        }
+    }
+
+    pub fn fill(&mut self) -> io::Result<()> {
+        let max_bytes = self.max_size - self.size;
+        let new_entries = self.segment.read_at_most(&self.curr_offset, &max_bytes)?;
+        for entry in new_entries {
+            self.size += entry.len() as u64 + size_of::<u32>() as u64;
+            self.curr_offset += entry.len() as u64 + size_of::<u32>() as u64;
+            self.buf.push_back(entry);
+        }
+        Ok(())
+    }
+
+    pub fn back(&self) -> Option<&SsTableEntry> {
+        self.buf.back()
+    }
+
+    pub fn front(&self) -> Option<&SsTableEntry> {
+        self.buf.front()
+    }
+
+    pub fn pop_front(&mut self) -> Option<SsTableEntry> {
+        match self.buf.front() {
+            Some(entry) => {
+                self.size -= (entry.len() + size_of::<u32>()) as u64;
+            }
+            None => (),
+        }
+        self.buf.pop_front()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use std::fs::{self, DirBuilder};
     use std::path::PathBuf;
@@ -1009,6 +1066,43 @@ mod tests {
             let entry_read = segment.get(&entry.key).unwrap().unwrap();
             assert_eq!(entry, entry_read);
         }
+        let no_entry = segment.get(&String::from("key")).unwrap();
+        assert!(matches!(no_entry, None));
+    }
+
+    #[test]
+    fn segment_read_buf_read_all() {
+        let dir = PathBuf::from("./sstable_segment_read_buf_read_all");
+        let cl = Cleanup { dir: dir.clone() };
+        assert!(cl.setup().is_ok());
+        let mut segment_writer = SegmentWriter::create_new_segment(&dir, &0, &0, 1).unwrap();
+        let entries = vec![
+            SsTableEntry {
+                key: String::from("key1"),
+                sequence_number: 0,
+                value: Some(String::from("value1")),
+            },
+            SsTableEntry {
+                key: String::from("key2"),
+                sequence_number: 1,
+                value: None,
+            },
+            SsTableEntry {
+                key: String::from("key3"),
+                sequence_number: 2,
+                value: Some(String::from("value3")),
+            },
+        ];
+        for entry in &entries {
+            segment_writer.write_entry(&entry).unwrap();
+        }
+        segment_writer.write_index_and_footer().unwrap();
+        let segment = Segment::from_file(segment_writer.filepath().clone()).unwrap();
+        let mut read_buf = SegmentReadBuf::new(Arc::new(segment), 1024);
+        read_buf.fill().unwrap();
+        assert_eq!(read_buf.buf.len(), 3);
+        let entries_read: Vec<SsTableEntry> = read_buf.buf.into_iter().collect();
+        assert_eq!(entries, entries_read);
     }
 }
 

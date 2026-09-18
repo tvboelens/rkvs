@@ -1,4 +1,4 @@
-use crate::storage_engine::sstable::level::segment::SegmentWriter;
+use crate::storage_engine::sstable::level::segment::{SegmentReadBuf, SegmentWriter};
 
 use super::SsTableEntry;
 pub use segment::Segment;
@@ -41,14 +41,6 @@ where
 pub struct LevelContainer {
     level_zero: Arc<SsTableLevel<OverlappingLevel>>,
     partitioned_levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>,
-}
-
-struct SegmentReadBuf {
-    segment: Arc<Segment>,
-    buf: VecDeque<SsTableEntry>,
-    curr_offset: u64,
-    size: u64,
-    max_size: u64,
 }
 
 impl LevelContainer {
@@ -232,13 +224,7 @@ impl PartitionedLevel {
         let mut res = Vec::new();
         let mut read_bufs: Vec<SegmentReadBuf> = Vec::new();
         for segment in segments {
-            read_bufs.push(SegmentReadBuf {
-                segment: segment.clone(),
-                buf: VecDeque::new(),
-                curr_offset: 0,
-                size: 0,
-                max_size: read_buf_len,
-            });
+            read_bufs.push(SegmentReadBuf::new(segment.clone(), read_buf_len));
         }
         let mut new_segment_number = self.highest_segment_number() + 1;
         let dir: PathBuf = segments
@@ -570,41 +556,6 @@ impl Clone for SsTableLevel<OverlappingLevel> {
     fn clone(&self) -> Self {
         let inner = self.inner.clone();
         SsTableLevel { inner: inner }
-    }
-}
-
-impl SegmentReadBuf {
-    fn fill(&mut self) -> io::Result<()> {
-        let max_bytes = self.max_size - self.size;
-        let new_entries = self.segment.read_at_most(&self.curr_offset, &max_bytes)?;
-        for entry in new_entries {
-            self.size += entry.len() as u64 + size_of::<u32>() as u64;
-            self.curr_offset += entry.len() as u64 + size_of::<u32>() as u64;
-            self.buf.push_back(entry);
-        }
-        Ok(())
-    }
-
-    fn back(&self) -> Option<&SsTableEntry> {
-        self.buf.back()
-    }
-
-    fn front(&self) -> Option<&SsTableEntry> {
-        self.buf.front()
-    }
-
-    fn pop_front(&mut self) -> Option<SsTableEntry> {
-        match self.buf.front() {
-            Some(entry) => {
-                self.size -= (entry.len() + size_of::<u32>()) as u64;
-            }
-            None => (),
-        }
-        self.buf.pop_front()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.buf.is_empty()
     }
 }
 
