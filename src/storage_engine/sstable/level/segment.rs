@@ -46,6 +46,7 @@ pub struct SegmentWriter {
     index: SegmentIndex,
     target_size: u64,
     entries_written: u64,
+    finished: bool,
 }
 
 pub struct SegmentReadBuf {
@@ -390,6 +391,7 @@ impl SegmentWriter {
             index: SegmentIndex::new(),
             index_sparsity_factor: index_sparsity_factor,
             target_size: SEGMENT_SIZE,
+            finished: false,
         })
     }
 
@@ -402,15 +404,23 @@ impl SegmentWriter {
     }
 
     pub fn write_index_and_footer(&mut self) -> io::Result<()> {
+        if self.finished {
+            panic!("tried to write to a finished sstable segment!");
+        }
         self.writer.write_all(&self.index.to_bytes())?;
         let footer = SegmentFooter {
             index_offset: self.curr_size,
         };
         self.writer.write_all(&footer.to_bytes())?;
-        self.writer.flush()
+        self.writer.flush()?;
+        self.finished = true;
+        Ok(())
     }
 
     pub fn write_entry(&mut self, entry: &SsTableEntry) -> io::Result<()> {
+        if self.finished {
+            panic!("tried to write to a finished sstable segment!");
+        }
         let bytes = entry.to_bytes();
         let entry_len = bytes.len() as u32;
         self.writer.write_all(&entry_len.to_le_bytes())?;
@@ -422,6 +432,10 @@ impl SegmentWriter {
         }
         self.curr_size += (bytes.len() + size_of::<u32>()) as u64;
         Ok(())
+    }
+
+    pub fn finished(&self) -> bool {
+        self.finished
     }
 }
 

@@ -200,7 +200,9 @@ impl PartitionedLevel {
                 untouched_segments.push(segment.clone());
             }
         }
-        segments.extend(incoming_segments.iter().map(|s| s.clone()));
+        for segment in incoming_segments {
+            segments.push(segment.clone());
+        }
         let mut new_segments = self.merge_and_write(&segments)?;
         new_segments.append(&mut untouched_segments);
         new_segments.sort_unstable_by(|s, t| s.first_key().cmp(t.first_key()));
@@ -282,6 +284,13 @@ impl PartitionedLevel {
                 .into_iter()
                 .filter(|buf| !buf.is_empty())
                 .collect();
+        }
+        // We might have exited the loop without writing the index and footer
+        // of the last segment. In that case do it here
+        if !segment_writer.finished() {
+            segment_writer.write_index_and_footer()?;
+            let new_segment = Segment::from_file(segment_writer.filepath().clone())?;
+            res.push(Arc::new(new_segment));
         }
         Ok(res)
     }
@@ -665,7 +674,7 @@ mod tests {
                 },
             ),
         ];
-        for (key, value) in &kv_pairs1 {
+        for (key, value) in &kv_pairs2 {
             table.insert(key.clone(), value.clone());
         }
         let sequence_number = 2;
@@ -681,7 +690,7 @@ mod tests {
         let level = Arc::new(SsTableLevel::<PartitionedLevel>::new(1024, 1));
         let segments = vec![Arc::new(segment1), Arc::new(segment2)];
         let (new_level, segments_to_delete) = level.merge(&segments).unwrap();
-        assert!(segments_to_delete.is_empty());
+        assert_eq!(segments_to_delete.len(), 2);
         for (key, value) in kv_pairs1 {
             let entry = SsTableEntry::from(key.clone(), value);
             let read_entry = new_level.get(&key).unwrap().unwrap();
