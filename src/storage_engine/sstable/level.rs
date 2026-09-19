@@ -352,6 +352,12 @@ fn merge_sort(read_bufs: &mut HashMap<usize, &mut SegmentReadBuf>) -> VecDeque<S
         }
     }
     read_bufs.retain(|_, buf| buf.front().unwrap().key <= smallest_final_key);
+    // The next key could be in a buffer that is removed in the previous line,
+    // therefore filter the next indices
+    next_indices = next_indices
+        .into_iter()
+        .filter(|idx| read_bufs.contains_key(idx))
+        .collect();
     while !read_bufs.is_empty() {
         let mut curr_bufs = Vec::new();
         for idx in &curr_indices {
