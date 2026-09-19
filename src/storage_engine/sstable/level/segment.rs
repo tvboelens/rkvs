@@ -23,6 +23,7 @@ Idea: separate writer/creator
 /// Segment of an SSTable level. This struct provides the interface to read entries from disk.
 /// It is read-only, for writing the SegmentWriter struct is used. It also gives access
 /// to metadata and internally stores the index in memory.
+#[derive(Debug)]
 pub struct Segment {
     file: File,
     filepath: PathBuf,
@@ -38,6 +39,7 @@ pub struct Segment {
 /// Utility struct to create and write to SSTable segments.
 /// It is used when flushing the memtable to disk as well
 /// during compaction, i.e. when merging segments.
+/// Writing is done via buffered writes.
 pub struct SegmentWriter {
     writer: BufWriter<File>,
     filepath: PathBuf,
@@ -49,6 +51,11 @@ pub struct SegmentWriter {
     finished: bool,
 }
 
+/// Buffered reader for a single segment, which is used
+/// during merge compaction. Once it is filled it
+/// behaves like a queue, but it also has a method
+/// to inspect the last sstable entry that was read.
+#[derive(Debug)]
 pub struct SegmentReadBuf {
     segment: Arc<Segment>,
     buf: VecDeque<SsTableEntry>,
@@ -81,6 +88,7 @@ enum IndexSearchResult {
 }
 
 impl Segment {
+    /// Read a segment from a file
     pub fn from_file(path: PathBuf) -> io::Result<Self> {
         let mut rfile = OpenOptions::new()
             .read(true)
@@ -130,6 +138,9 @@ impl Segment {
         })
     }
 
+    /// Finds the entry belonging to a key. If there is no entry,
+    /// None is returned. The entry is wrapped in an io::Result, since
+    /// it is read from disk.
     pub fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>> {
         match self.index.find(key) {
             IndexSearchResult::Match(offset) => {
@@ -150,6 +161,9 @@ impl Segment {
         }
     }
 
+    /// Read as much entries starting at offset as either fit into max_bytes
+    /// or until last entry is reached. The offset should be chosen so that
+    /// it coincides with the start of an sstable entry.
     pub fn read_at_most(
         &self,
         offset: &u64,
@@ -177,18 +191,25 @@ impl Segment {
         Ok(SsTableEntry::deque_from_bytes(&entry_buf))
     }
 
+    /// Returns the first key contained in the segment.
     pub fn first_key(&self) -> &String {
         &self.first_key
     }
 
+    /// Returns the final key contained in the segment.
     pub fn last_key(&self) -> &String {
         &self.last_key
     }
 
+    /// Returns the segment number. Each segment has a unique number
+    /// within its level, higher means that the segment is newer.
+    /// This is mostly used for bookkeeping during compaction and
+    /// recovery.
     pub fn segment_number(&self) -> &u64 {
         &self.number
     }
 
+    /// Reads multiple from the start position in the file to end position.
     fn read_table_entries(file: &File, start: u64, end: u64) -> io::Result<Vec<SsTableEntry>> {
         let mut curr_offset = start.clone();
         let mut buf = Vec::<u8>::new();
@@ -207,6 +228,7 @@ impl Segment {
         Ok(Segment::parse_entries(buf))
     }
 
+    /// Read a single segment entry starting at offset
     fn read_table_entry(file: &File, offset: &u64) -> io::Result<SsTableEntry> {
         let mut curr_offset = offset.clone();
         let mut buf_offset: usize = 0;
@@ -240,66 +262,29 @@ impl Segment {
         Ok(SsTableEntry::from_bytes(&entry_buf))
     }
 
+    /// Returns segment file size
     pub fn size(&self) -> u64 {
         self.size
     }
 
+    /// Returns the highest sequence number of the entries
+    /// contained in this segment. This is used during MemTable
+    /// recovery.
     pub fn highest_sequence_number(&self) -> u64 {
         self.highest_sequence_no
     }
 
+    /// Returns the filepath to the segment file.
     pub fn filepath(&self) -> PathBuf {
         self.filepath.clone()
     }
 
+    /// Returns whether self and the other have overlapping key ranges.
     pub fn overlaps(&self, other: &Segment) -> bool {
         other.first_key <= self.last_key && self.first_key <= other.last_key
     }
 
-    // TODO: these two writing functions almost do the same, can they be abstracted?
-    pub fn write_slice(
-        &mut self,
-        slice: &mut VecDeque<SsTableEntry>,
-        target_size: &u64,
-        index_sparsity_factor: u32,
-    ) -> io::Result<()> {
-        let mut file_size = self.file.metadata()?.size();
-        let mut buf_writer = BufWriter::new(&self.file);
-        let mut segment_index_size = self.index.size();
-        let mut counter: u32 = 0;
-        while let Some(entry) = slice.front() {
-            let offset = file_size;
-            let bytes = entry.to_bytes();
-            let entry_len = bytes.len() as u32;
-            file_size += entry_len as u64;
-            file_size += size_of::<u32>() as u64;
-            if counter % index_sparsity_factor == 0 {
-                segment_index_size += entry.key.len() as u64;
-                segment_index_size += entry.key.len() as u64;
-            }
-            if file_size + segment_index_size + MAGIC_BYTES.len() as u64 + SEGMENT_FOOTER_LEN
-                > *target_size
-            {
-                let footer = SegmentFooter {
-                    index_offset: file_size,
-                };
-                buf_writer.write_all(&self.index.to_bytes())?;
-                buf_writer.write_all(&footer.to_bytes())?;
-                buf_writer.write_all(&MAGIC_BYTES)?;
-                break;
-            }
-            if counter % index_sparsity_factor == 0 {
-                self.index.add_index(entry.key.clone(), offset);
-            }
-            buf_writer.write_all(&entry_len.to_le_bytes())?;
-            buf_writer.write_all(&bytes)?;
-            counter += 1;
-            let _ = slice.pop_front();
-        }
-        buf_writer.flush()?;
-        Ok(())
-    }
-
+    /// Utility function to determine the file name for a new segment.
     fn determine_segment_filename(level_number: &u64, segment_number: &u64) -> String {
         let mut padding_bytes = Vec::<u8>::new();
         let mut level_number_hex_str = format!("{:x}", level_number);
@@ -311,6 +296,7 @@ impl Segment {
         level_number_hex_str + &segment_number_hex_str + ".sst"
     }
 
+    /// Deserializes sstable entries from raw bytes.
     fn parse_entries(buf: Vec<u8>) -> Vec<SsTableEntry> {
         let mut res = Vec::new();
         let mut offset: usize = 0;
@@ -329,6 +315,9 @@ impl Segment {
 }
 
 impl SegmentWriter {
+    /// Creates an sstable segment file from a memtable,
+    /// i.e. this is the actual implementation of flushing
+    /// a memtable to the sstable.
     pub fn segment_file_from_memtable(
         dir: &PathBuf,
         table: &HashMap<String, MemTableValue>,
@@ -370,6 +359,10 @@ impl SegmentWriter {
         Ok(filepath)
     }
 
+    /// Creates the new segment file and returns the segment writer
+    /// that will write to this file. This method will not write
+    /// to the segment file, so after returning the segment file
+    /// will still be empty.
     pub fn create_new_segment(
         dir: &PathBuf,
         level_number: &u64,
@@ -395,14 +388,22 @@ impl SegmentWriter {
         })
     }
 
+    /// Returns the filepath of the segment file the writer is
+    /// writing to. Mainly used to obtain the filepath after writing
+    /// is finished so that [`Segment::from_file`](Segment::from_file) can be used.
     pub fn filepath(&self) -> &PathBuf {
         &self.filepath
     }
 
+    /// Returns whether the file has reached target size, i.e. if we should stop writing.
+    /// Call [`write_index_and_footer`](SegmentWriter::write_index_and_footer) if this returns true.
     pub fn reached_target_size(&self) -> bool {
         self.curr_size + self.index.len as u64 + SEGMENT_FOOTER_LEN >= self.target_size
     }
 
+    /// Write the index and the footer at the end of the segment file.
+    /// This method may only be called once and panics if it is called
+    /// a second time.
     pub fn write_index_and_footer(&mut self) -> io::Result<()> {
         if self.finished {
             panic!("tried to write to a finished sstable segment!");
@@ -417,6 +418,7 @@ impl SegmentWriter {
         Ok(())
     }
 
+    /// Writes a single sstable entry to the file.
     pub fn write_entry(&mut self, entry: &SsTableEntry) -> io::Result<()> {
         if self.finished {
             panic!("tried to write to a finished sstable segment!");
@@ -434,6 +436,9 @@ impl SegmentWriter {
         Ok(())
     }
 
+    /// Returns whether the writer has finished writing,
+    /// i.e. if [`write_index_and_footer`](SegmentWriter::write_index_and_footer)
+    /// has been called.
     pub fn finished(&self) -> bool {
         self.finished
     }
@@ -584,6 +589,8 @@ impl SegmentFooter {
 }
 
 impl SegmentReadBuf {
+    /// Create a new buffered reader that reads from segment
+    /// and internally holds a maximum of read_buf_len bytes
     pub fn new(segment: Arc<Segment>, read_buf_len: u64) -> Self {
         SegmentReadBuf {
             segment: segment,
@@ -594,6 +601,9 @@ impl SegmentReadBuf {
         }
     }
 
+    /// Tries to read sstable entries from the segment until
+    /// either the maximum amount of bytes is read or
+    /// the last entry of the segment is read.
     pub fn fill(&mut self) -> io::Result<()> {
         let max_bytes = self.max_size - self.size;
         let new_entries = self.segment.read_at_most(&self.curr_offset, &max_bytes)?;
@@ -605,14 +615,17 @@ impl SegmentReadBuf {
         Ok(())
     }
 
+    /// Access the last entry in the buffer
     pub fn back(&self) -> Option<&SsTableEntry> {
         self.buf.back()
     }
 
+    /// Access the first entry in the buffer
     pub fn front(&self) -> Option<&SsTableEntry> {
         self.buf.front()
     }
 
+    /// Pop the first entry from the buffer
     pub fn pop_front(&mut self) -> Option<SsTableEntry> {
         match self.buf.front() {
             Some(entry) => {
@@ -1130,6 +1143,68 @@ mod tests {
         assert_eq!(read_buf.buf.len(), 3);
         let entries_read: Vec<SsTableEntry> = read_buf.buf.into_iter().collect();
         assert_eq!(entries, entries_read);
+    }
+
+    #[test]
+    fn segment_read_buf_read_partial() {
+        let dir = PathBuf::from("./sstable_segment_read_buf_read_partial");
+        let cl = Cleanup { dir: dir.clone() };
+        assert!(cl.setup().is_ok());
+        let mut segment_writer = SegmentWriter::create_new_segment(&dir, &0, &0, 1).unwrap();
+        let entries = vec![
+            SsTableEntry {
+                key: String::from("key1"),
+                sequence_number: 0,
+                value: Some(String::from("value1")),
+            },
+            SsTableEntry {
+                key: String::from("key2"),
+                sequence_number: 1,
+                value: None,
+            },
+            SsTableEntry {
+                key: String::from("key3"),
+                sequence_number: 2,
+                value: Some(String::from("value3")),
+            },
+            SsTableEntry {
+                key: String::from("key4"),
+                sequence_number: 3,
+                value: Some(String::from("value4")),
+            },
+            SsTableEntry {
+                key: String::from("key5"),
+                sequence_number: 4,
+                value: Some(String::from("value5")),
+            },
+            SsTableEntry {
+                key: String::from("key6"),
+                sequence_number: 5,
+                value: None,
+            },
+            SsTableEntry {
+                key: String::from("key7"),
+                sequence_number: 6,
+                value: Some(String::from("value7")),
+            },
+        ];
+        for entry in &entries {
+            segment_writer.write_entry(&entry).unwrap();
+        }
+        segment_writer.write_index_and_footer().unwrap();
+        let segment = Segment::from_file(segment_writer.filepath().clone()).unwrap();
+        let mut read_buf = SegmentReadBuf::new(Arc::new(segment), 128);
+        read_buf.fill().unwrap();
+        assert_eq!(read_buf.buf.len(), 4);
+        let mut entries_read = Vec::new();
+        while let Some(entry) = read_buf.pop_front() {
+            entries_read.push(entry);
+        }
+        assert_eq!(entries[0..4], entries_read);
+        read_buf.fill().unwrap();
+        assert_eq!(read_buf.buf.len(), 3);
+        let entries_read: Vec<SsTableEntry> = read_buf.buf.into_iter().collect();
+        assert_eq!(entries[4..], entries_read);
     }
 }
 
