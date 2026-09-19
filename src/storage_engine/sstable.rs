@@ -190,7 +190,25 @@ impl SsTableEntry {
         }
     }
 
-    pub fn deque_from_bytes(bytes: &Vec<u8>) -> VecDeque<Self> {
+    /// Deserializes sstable entries from raw bytes.
+    pub fn vec_from_bytes(buf: &[u8]) -> Vec<Self> {
+        let mut res = Vec::new();
+        let mut offset: usize = 0;
+        let mut u32_buf: [u8; size_of::<u32>()] = [0, 0, 0, 0];
+        while offset < buf.len() {
+            u32_buf.copy_from_slice(&buf[offset..offset + size_of::<u32>()]);
+            let record_len = u32::from_le_bytes(u32_buf);
+            offset += size_of::<u32>();
+            res.push(SsTableEntry::from_bytes(
+                &buf[offset..offset + record_len as usize].to_vec(),
+            ));
+            offset += record_len as usize;
+        }
+        res
+    }
+
+    /// Deserializes sstable entries from raw bytes.
+    pub fn deque_from_bytes(bytes: &[u8]) -> VecDeque<Self> {
         let mut res = VecDeque::new();
         let mut offset: usize = 0;
         while offset + size_of::<u32>() < bytes.len() {
@@ -198,7 +216,7 @@ impl SsTableEntry {
             u32_buf.copy_from_slice(&bytes[offset..offset + size_of::<u32>()]);
             let entry_size = u32::from_le_bytes(u32_buf) as usize;
             offset += size_of::<u32>();
-            if offset + entry_size < bytes.len() {
+            if offset + entry_size <= bytes.len() {
                 res.push_back(SsTableEntry::from_bytes(
                     &bytes[offset..offset + entry_size],
                 ));
@@ -214,6 +232,7 @@ impl SsTableEntry {
 #[cfg(test)]
 mod tests {
     use super::SsTableEntry;
+    use crate::storage_engine::memtable::MemTableValue;
 
     #[test]
     fn entry_to_bytes_value() {
@@ -237,5 +256,236 @@ mod tests {
         let bytes = entry_write.to_bytes();
         let entry_read = SsTableEntry::from_bytes(&bytes);
         assert_eq!(entry_read, entry_write);
+    }
+
+    #[test]
+    fn parse_multiple_entries() {
+        let kv_pairs = vec![
+            (
+                String::from("first_key"),
+                MemTableValue {
+                    value: Some(String::from("first_value")),
+                    sequence_number: 1,
+                },
+            ),
+            (
+                String::from("second_key"),
+                MemTableValue {
+                    value: Some(String::from("second_value")),
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("third_key"),
+                MemTableValue {
+                    value: None,
+                    sequence_number: 3,
+                },
+            ),
+            (
+                String::from("fourth_key"),
+                MemTableValue {
+                    value: Some(String::from("fourth_value")),
+                    sequence_number: 4,
+                },
+            ),
+            (
+                String::from("fifth_key"),
+                MemTableValue {
+                    value: Some(String::from("fifth_value")),
+                    sequence_number: 5,
+                },
+            ),
+            (
+                String::from("sixth_key"),
+                MemTableValue {
+                    value: Some(String::from("sixth_value")),
+                    sequence_number: 6,
+                },
+            ),
+            (
+                String::from("seventh_key"),
+                MemTableValue {
+                    value: Some(String::from("seventh_value")),
+                    sequence_number: 7,
+                },
+            ),
+            (
+                String::from("eighth_key"),
+                MemTableValue {
+                    value: Some(String::from("eighth_value")),
+                    sequence_number: 8,
+                },
+            ),
+            (
+                String::from("ninth_key"),
+                MemTableValue {
+                    value: Some(String::from("ninth_value")),
+                    sequence_number: 9,
+                },
+            ),
+            (
+                String::from("tenth_key"),
+                MemTableValue {
+                    value: Some(String::from("tenth_value")),
+                    sequence_number: 10,
+                },
+            ),
+        ];
+        let entries_write: Vec<SsTableEntry> = kv_pairs
+            .iter()
+            .map(|(key, value)| SsTableEntry::from(key.clone(), value.clone()))
+            .collect();
+        let mut bytes = Vec::<u8>::new();
+        for entry in &entries_write {
+            let entry_len = entry.len() as u32;
+            bytes.append(&mut entry_len.to_le_bytes().to_vec());
+            bytes.append(&mut entry.to_bytes());
+        }
+        let entries_read = SsTableEntry::vec_from_bytes(&bytes);
+        assert_eq!(entries_read, entries_write);
+    }
+
+    #[test]
+    fn parse_multiple_entries_deque() {
+        let kv_pairs = vec![
+            (
+                String::from("first_key"),
+                MemTableValue {
+                    value: Some(String::from("first_value")),
+                    sequence_number: 1,
+                },
+            ),
+            (
+                String::from("second_key"),
+                MemTableValue {
+                    value: None,
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("third_key"),
+                MemTableValue {
+                    value: Some(String::from("third_value")),
+                    sequence_number: 3,
+                },
+            ),
+            (
+                String::from("fourth_key"),
+                MemTableValue {
+                    value: Some(String::from("fourth_value")),
+                    sequence_number: 4,
+                },
+            ),
+            (
+                String::from("fifth_key"),
+                MemTableValue {
+                    value: Some(String::from("fifth_value")),
+                    sequence_number: 5,
+                },
+            ),
+            (
+                String::from("sixth_key"),
+                MemTableValue {
+                    value: Some(String::from("sixth_value")),
+                    sequence_number: 6,
+                },
+            ),
+            (
+                String::from("seventh_key"),
+                MemTableValue {
+                    value: Some(String::from("seventh_value")),
+                    sequence_number: 7,
+                },
+            ),
+            (
+                String::from("eighth_key"),
+                MemTableValue {
+                    value: Some(String::from("eighth_value")),
+                    sequence_number: 8,
+                },
+            ),
+            (
+                String::from("ninth_key"),
+                MemTableValue {
+                    value: Some(String::from("ninth_value")),
+                    sequence_number: 9,
+                },
+            ),
+            (
+                String::from("tenth_key"),
+                MemTableValue {
+                    value: Some(String::from("tenth_value")),
+                    sequence_number: 10,
+                },
+            ),
+        ];
+        let entries_write: Vec<SsTableEntry> = kv_pairs
+            .iter()
+            .map(|(key, value)| SsTableEntry::from(key.clone(), value.clone()))
+            .collect();
+        let mut bytes = Vec::<u8>::new();
+        for entry in &entries_write {
+            let entry_len = entry.len() as u32;
+            bytes.append(&mut entry_len.to_le_bytes().to_vec());
+            bytes.append(&mut entry.to_bytes());
+        }
+        let entries_read = SsTableEntry::deque_from_bytes(&bytes);
+        let entries_read: Vec<SsTableEntry> = entries_read.into_iter().collect();
+        assert_eq!(entries_read, entries_write);
+    }
+
+    #[test]
+    fn parse_multiple_entries_last_partial_deque() {
+        let kv_pairs = vec![
+            (
+                String::from("first_key"),
+                MemTableValue {
+                    value: Some(String::from("first_value")),
+                    sequence_number: 1,
+                },
+            ),
+            (
+                String::from("second_key"),
+                MemTableValue {
+                    value: None,
+                    sequence_number: 2,
+                },
+            ),
+            (
+                String::from("third_key"),
+                MemTableValue {
+                    value: Some(String::from("third_value")),
+                    sequence_number: 3,
+                },
+            ),
+            (
+                String::from("fourth_key"),
+                MemTableValue {
+                    value: Some(String::from("fourth_value")),
+                    sequence_number: 4,
+                },
+            ),
+        ];
+        let entries_write: Vec<SsTableEntry> = kv_pairs
+            .iter()
+            .map(|(key, value)| SsTableEntry::from(key.clone(), value.clone()))
+            .collect();
+        let mut bytes = Vec::<u8>::new();
+        for entry in &entries_write {
+            let entry_len = entry.len() as u32;
+            bytes.append(&mut entry_len.to_le_bytes().to_vec());
+            bytes.append(&mut entry.to_bytes());
+        }
+        let partial_entry = SsTableEntry {
+            key: String::from("fifth_key"),
+            value: Some(String::from("fifth_value")),
+            sequence_number: 5,
+        };
+        bytes.append(&mut partial_entry.len().to_le_bytes().to_vec());
+        bytes.append(&mut partial_entry.to_bytes()[0..4].to_vec());
+        let entries_read = SsTableEntry::deque_from_bytes(&bytes);
+        let entries_read: Vec<SsTableEntry> = entries_read.into_iter().collect();
+        assert_eq!(entries_read, entries_write);
     }
 }
