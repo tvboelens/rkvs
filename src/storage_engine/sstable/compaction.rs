@@ -7,7 +7,7 @@ use std::io;
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
-struct CompactionBt {
+pub struct CompactionBt {
     container: Arc<RwLock<LevelContainer>>,
     segments_to_delete: Vec<Arc<Segment>>,
     cv: Arc<Condvar>,
@@ -193,7 +193,7 @@ impl CompactionBt {
         }
     }
 
-    fn run(&mut self) {
+    pub fn run(&mut self) {
         let mut do_compact: bool;
         loop {
             {

@@ -45,6 +45,28 @@ pub struct LevelContainer {
 }
 
 impl LevelContainer {
+    pub fn new(level_zero_target_size: u64) -> Self {
+        let level = OverlappingLevel {
+            segments: Vec::new(),
+            target_size: level_zero_target_size,
+        };
+        let level_zero = SsTableLevel { inner: level };
+        LevelContainer {
+            level_zero: Arc::new(level_zero),
+            partitioned_levels: Vec::new(),
+        }
+    }
+
+    pub fn from(
+        level_zero: Arc<SsTableLevel<OverlappingLevel>>,
+        higher_levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>,
+    ) -> Self {
+        LevelContainer {
+            level_zero: level_zero,
+            partitioned_levels: higher_levels,
+        }
+    }
+
     pub fn level_zero(&self) -> Arc<SsTableLevel<OverlappingLevel>> {
         self.level_zero.clone()
     }

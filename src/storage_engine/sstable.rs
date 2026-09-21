@@ -1,3 +1,6 @@
+mod compaction;
+pub mod level;
+
 use crate::storage_engine::memtable::MemTableValue;
 use level::{LevelContainer, OverlappingLevel, PartitionedLevel, SsTableLevel};
 use std::collections::VecDeque;
@@ -6,8 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar};
 use std::sync::{Mutex, RwLock};
 
-mod compaction;
-pub mod level;
+use compaction::CompactionBt;
 
 #[derive(PartialEq, Debug, Clone)]
 pub struct SsTableEntry {
@@ -23,8 +25,32 @@ pub struct SsTable {
 }
 
 impl SsTable {
-    pub fn start() -> io::Result<Self> {
-        todo!()
+    pub fn start(
+        dir: &PathBuf,
+        level_zero_target_size: u64,
+        level_size_factor: u64,
+    ) -> io::Result<Self> {
+        /*
+        TODO: detect existing files and do recovery. Depending on recovery create container from
+        existing files or create a new one
+         */
+        let do_compact = false;
+        let do_compact_ptr = Arc::new(Mutex::new(do_compact));
+        let container = LevelContainer::new(level_zero_target_size);
+        let container_ptr = Arc::new(RwLock::new(container));
+        let cv = Arc::new(Condvar::new());
+        let mut compaction_bt = CompactionBt::new(
+            container_ptr.clone(),
+            cv.clone(),
+            do_compact_ptr.clone(),
+            level_size_factor,
+        );
+        let _ = std::thread::spawn(move || compaction_bt.run());
+        Ok(SsTable {
+            compaction_bt_cv: cv,
+            inner: container_ptr,
+            do_compact: do_compact_ptr,
+        })
     }
 
     pub fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>> {

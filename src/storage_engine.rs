@@ -56,6 +56,8 @@ pub struct StorageEngineConf {
     segment_size: u32,
     memtable_max_size: u64,
     sstable_index_sparsity_factor: u32,
+    level_zero_size: u64,
+    level_size_factor: u64,
 }
 
 #[derive(Debug)]
@@ -108,7 +110,11 @@ impl Store for StorageEngine {
 
 impl StorageEngine {
     pub fn new(config: StorageEngineConf) -> io::Result<Self> {
-        let sstable = SsTable::start()?; // TODO: sstable also needs to know about the dir
+        let sstable = SsTable::start(
+            &config.dir.join("SSTable"),
+            config.level_zero_size,
+            config.level_size_factor,
+        )?;
         let sstable_ptr = Arc::new(sstable); // TODO: recover
         let flusher = Flusher::from(
             sstable_ptr.clone(),
