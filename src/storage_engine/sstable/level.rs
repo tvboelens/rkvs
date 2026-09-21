@@ -106,7 +106,19 @@ impl SstLevel for OverlappingLevel {
     }
 
     fn segments_to_merge(&self) -> Vec<Arc<Segment>> {
-        self.segments.clone()
+        let mut segments_to_merge = Vec::new();
+        let mut size: u64 = self.segments.iter().map(|s| s.size()).sum();
+        let mut curr_segment_number = self.highest_segment_number();
+        while size > self.target_size {
+            for segment in &self.segments {
+                if *segment.segment_number() == curr_segment_number {
+                    segments_to_merge.push(segment.clone());
+                    size -= segment.size();
+                }
+                curr_segment_number -= 1;
+            }
+        }
+        segments_to_merge
     }
 
     fn exceeds_target_size(&self) -> bool {
@@ -134,7 +146,19 @@ impl SstLevel for PartitionedLevel {
     }
 
     fn segments_to_merge(&self) -> Vec<Arc<Segment>> {
-        self.segments.clone()
+        let mut segments_to_merge = Vec::new();
+        let mut size: u64 = self.segments.iter().map(|s| s.size()).sum();
+        let mut curr_segment_number = self.highest_segment_number();
+        while size > self.target_size {
+            for segment in &self.segments {
+                if *segment.segment_number() == curr_segment_number {
+                    segments_to_merge.push(segment.clone());
+                    size -= segment.size();
+                }
+                curr_segment_number -= 1;
+            }
+        }
+        segments_to_merge
     }
 
     fn exceeds_target_size(&self) -> bool {
@@ -712,24 +736,9 @@ mod tests {
 
 /*
 TODO:
-1. Probably write the merge functions first
-    1. This would allow us in tests to create levels in line with later implementation
-    2. The merge function itself should also be easy to test -> apply, read segment file and test the segment file
-2. Testing
+Testing
     1. Merge function
         1. The segments are OK
         2. The resulting level is indeed non-overlapping
     2. Reading when multiple levels are involved -> make sure newest version is read if the key is in multiple levels
-3. We also want to be able to detect the key range of a segment somehow, i.e. first and last key
-    1. This way we can find out which segment to read from within a level instead of trying to read them all
-    2. question is how to do this
-        1. In memory
-            1. So just in the segment struct itself, read when creating the segment
-            2. For first key this is one read
-            3. For last key take the last key that is indexed, read until end of data block, parse and take last entry
-            4. potential downside is that this will lead to higher memory consumption, since large dbs will have a lot of segments
-        2. On-disk
-            1. Filename -> seems like a bad idea, since key length can be variable
-            2. Just read directly from disk
-
 */
