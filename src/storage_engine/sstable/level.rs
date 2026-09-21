@@ -17,6 +17,7 @@ pub trait SstLevel {
     fn segments_to_merge(&self) -> Vec<Arc<Segment>>;
     fn exceeds_target_size(&self) -> bool;
     fn highest_segment_number(&self) -> u64;
+    fn target_size(&self) -> u64;
 }
 
 #[derive(Clone)]
@@ -135,6 +136,10 @@ impl SstLevel for OverlappingLevel {
         }
         res
     }
+
+    fn target_size(&self) -> u64 {
+        self.target_size
+    }
 }
 
 impl SstLevel for PartitionedLevel {
@@ -174,6 +179,10 @@ impl SstLevel for PartitionedLevel {
             }
         }
         res
+    }
+
+    fn target_size(&self) -> u64 {
+        self.target_size
     }
 }
 
@@ -534,6 +543,10 @@ where
     pub fn highest_segment_number(&self) -> u64 {
         self.inner.highest_segment_number()
     }
+
+    pub fn target_size(&self) -> u64 {
+        self.inner.target_size()
+    }
 }
 
 impl SsTableLevel<PartitionedLevel> {
@@ -563,6 +576,10 @@ impl SsTableLevel<PartitionedLevel> {
         segments: &Vec<Arc<Segment>>,
     ) -> io::Result<(Arc<SsTableLevel<PartitionedLevel>>, Vec<Arc<Segment>>)> {
         self.inner.merge(segments)
+    }
+
+    pub fn level_number(&self) -> u64 {
+        self.inner.level_number
     }
 }
 

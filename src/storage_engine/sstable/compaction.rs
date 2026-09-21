@@ -12,18 +12,35 @@ struct CompactionBt {
     segments_to_delete: Vec<Arc<Segment>>,
     cv: Arc<Condvar>,
     do_compact: Arc<Mutex<bool>>,
+    level_size_factor: u64,
 }
 
 impl CompactionBt {
+    pub fn new(
+        container: Arc<RwLock<LevelContainer>>,
+        cv: Arc<Condvar>,
+        do_compact: Arc<Mutex<bool>>,
+        level_size_factor: u64,
+    ) -> Self {
+        CompactionBt {
+            container: container,
+            segments_to_delete: Vec::new(),
+            cv: cv,
+            do_compact: do_compact,
+            level_size_factor: level_size_factor,
+        }
+    }
     /// Compaction starting at level 0, that is the first merge is from level 0 into level 1.
     /// This method will successively merge into higher levels until a merge is completed
     /// and the resulting level does not exceed target size.
     fn compact_from_level_zero(&mut self) -> io::Result<Vec<Arc<SsTableLevel<PartitionedLevel>>>> {
         let level_zero: Arc<SsTableLevel<OverlappingLevel>>;
+        let mut previous_target_size: u64;
         let mut partitioned_levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>;
         {
             let lock = self.container.read().unwrap();
             level_zero = lock.level_zero();
+            previous_target_size = level_zero.target_size();
             partitioned_levels = lock.partitioned_levels();
         }
 
@@ -31,19 +48,24 @@ impl CompactionBt {
         let mut new_partitioned_level: Arc<SsTableLevel<PartitionedLevel>>;
         let mut segments_to_merge = level_zero.segments_to_merge();
         let mut segments_to_delete: Vec<Arc<Segment>>;
-        let mut level_number = 1; // TODO: is this the right way to do it?
+        let mut level_number = 1;
         loop {
             match partitioned_levels.first() {
                 Some(level) => {
+                    previous_target_size = level.target_size();
                     // maybe do a match here to clean up if error?
                     (new_partitioned_level, segments_to_delete) =
                         level.merge(&segments_to_merge)?;
                     self.segments_to_delete.append(&mut segments_to_delete);
                     new_partitioned_levels.push(new_partitioned_level.clone());
-                    let _ = partitioned_levels.remove(0); // TODO: maybe VecDeque is better for this purpose
+                    let _ = partitioned_levels.remove(0);
                 }
                 None => {
-                    let level = Arc::new(SsTableLevel::<PartitionedLevel>::new(0, level_number));
+                    let target_size = previous_target_size * self.level_size_factor;
+                    let level = Arc::new(SsTableLevel::<PartitionedLevel>::new(
+                        target_size,
+                        level_number,
+                    ));
                     // maybe do a match here to clean up if error?
                     (new_partitioned_level, segments_to_delete) =
                         level.merge(&segments_to_merge)?;
@@ -64,8 +86,7 @@ impl CompactionBt {
     /// Compaction starting at a higher level.
     /// This method will successively merge into higher levels until a merge is completed
     /// and the resulting level does not exceed target size.
-    /// In theory this method should never be called, but it might be necessary if an
-    /// older compaction failed.
+    /// This method is primarily used during recovery of the sstable.
     fn compact_from_partitioned_level(
         &mut self,
         mut levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>,
@@ -74,6 +95,8 @@ impl CompactionBt {
             return Ok(Vec::new());
         }
         let mut segments_to_merge = levels.first().unwrap().segments_to_merge();
+        let mut previous_target_size = levels.first().unwrap().target_size();
+        let mut curr_level_no = levels.first().unwrap().level_number() + 1;
         let mut new_partitioned_levels = Vec::new();
         let mut new_partitioned_level: Arc<SsTableLevel<PartitionedLevel>>;
         let mut segments_to_delete: Vec<Arc<Segment>>;
@@ -81,6 +104,7 @@ impl CompactionBt {
         loop {
             match levels.first() {
                 Some(level) => {
+                    previous_target_size = level.target_size();
                     // maybe do a match here to clean up if error?
                     (new_partitioned_level, segments_to_delete) =
                         level.merge(&segments_to_merge)?;
@@ -89,7 +113,11 @@ impl CompactionBt {
                     let _ = levels.remove(0); // TODO: maybe VecDeque is better for this purpose
                 }
                 None => {
-                    let level = Arc::new(SsTableLevel::<PartitionedLevel>::new(0, 0));
+                    let target_size = previous_target_size * self.level_size_factor;
+                    let level = Arc::new(SsTableLevel::<PartitionedLevel>::new(
+                        target_size,
+                        curr_level_no,
+                    ));
                     // maybe do a match here to clean up if error?
                     (new_partitioned_level, segments_to_delete) =
                         level.merge(&segments_to_merge)?;
@@ -97,6 +125,7 @@ impl CompactionBt {
                     new_partitioned_levels.push(new_partitioned_level.clone());
                 }
             }
+            curr_level_no += 1;
             if !new_partitioned_level.exceeds_target_size() {
                 break;
             }
