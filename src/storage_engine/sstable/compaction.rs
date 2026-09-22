@@ -4,14 +4,14 @@ use crate::storage_engine::sstable::level::{
 };
 use std::fs::remove_file;
 use std::io;
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock, WaitTimeoutResult};
 use std::time::Duration;
 
 pub struct CompactionBt {
     container: Arc<RwLock<LevelContainer>>,
     segments_to_delete: Vec<Arc<Segment>>,
     cv: Arc<Condvar>,
-    do_compact: Arc<Mutex<bool>>,
+    stop: Arc<Mutex<bool>>,
     level_size_factor: u64,
 }
 
@@ -19,14 +19,14 @@ impl CompactionBt {
     pub fn new(
         container: Arc<RwLock<LevelContainer>>,
         cv: Arc<Condvar>,
-        do_compact: Arc<Mutex<bool>>,
+        stop: Arc<Mutex<bool>>,
         level_size_factor: u64,
     ) -> Self {
         CompactionBt {
             container: container,
             segments_to_delete: Vec::new(),
             cv: cv,
-            do_compact: do_compact,
+            stop: stop,
             level_size_factor: level_size_factor,
         }
     }
@@ -194,18 +194,22 @@ impl CompactionBt {
     }
 
     pub fn run(&mut self) {
-        let mut do_compact: bool;
         loop {
+            let stop: bool;
+            let timeout_result: WaitTimeoutResult;
             {
-                let lock = self.do_compact.lock().unwrap();
+                let lock = self.stop.lock().unwrap();
                 let res = self
                     .cv
                     .wait_timeout(lock, Duration::from_millis(5000))
                     .unwrap();
-                do_compact = *res.0;
+                stop = *res.0;
+                timeout_result = res.1;
             }
 
-            if do_compact {
+            if stop {
+                break;
+            } else if !timeout_result.timed_out() {
                 match self.compact_from_level_zero() {
                     Ok(new_levels) => {
                         {

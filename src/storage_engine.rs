@@ -39,11 +39,11 @@ struct Job {
 }
 
 pub struct StorageEngine {
-    //memtable: Arc<AtomicPtr<memtable::MemTable>>,
     sender: mpsc::Sender<Job>,
     join_handles: Vec<std::thread::JoinHandle<()>>,
 }
 
+#[derive(Clone)]
 struct Worker {
     memtable: Arc<memtable::MemTable>,
     sstable: Arc<sstable::SsTable>,
@@ -146,7 +146,15 @@ impl StorageEngine {
             join_handles: join_handles,
         })
     }
-
+    /*
+    TODO: There are some subtleties here, since we wrap the
+    storage engine in an Arc. There are 2 options
+    1. In main check the ref count of the storage engine,
+       if it is more than 1, sleep. If it is 1, can call
+       Arc::into_inner or Arc::try_unwrap and then call shutdown
+    2. Or we pass the join handles to main and main calls join(),
+       which would solve the ownership issue.
+    */
     pub fn shutdown(self) {
         drop(self.sender);
         for handle in self.join_handles {
@@ -203,16 +211,6 @@ impl Worker {
         self.memtable
             .delete(key)
             .map(|opt| opt.map(|mvalue| mvalue.value).flatten())
-    }
-}
-
-impl Clone for Worker {
-    fn clone(&self) -> Self {
-        Worker {
-            memtable: self.memtable.clone(),
-            sstable: self.sstable.clone(),
-            receiver: self.receiver.clone(),
-        }
     }
 }
 

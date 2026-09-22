@@ -8,6 +8,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar};
 use std::sync::{Mutex, RwLock};
+use std::thread::JoinHandle;
 
 use compaction::CompactionBt;
 
@@ -21,7 +22,8 @@ pub struct SsTableEntry {
 pub struct SsTable {
     inner: Arc<RwLock<LevelContainer>>,
     compaction_bt_cv: Arc<Condvar>,
-    do_compact: Arc<Mutex<bool>>,
+    bt_stop: Arc<Mutex<bool>>,
+    join_handle: Option<JoinHandle<()>>,
 }
 
 impl SsTable {
@@ -34,22 +36,23 @@ impl SsTable {
         TODO: detect existing files and do recovery. Depending on recovery create container from
         existing files or create a new one
          */
-        let do_compact = false;
-        let do_compact_ptr = Arc::new(Mutex::new(do_compact));
+        let bt_stop = false;
+        let bt_stop_ptr = Arc::new(Mutex::new(bt_stop));
         let container = LevelContainer::new(level_zero_target_size);
         let container_ptr = Arc::new(RwLock::new(container));
         let cv = Arc::new(Condvar::new());
         let mut compaction_bt = CompactionBt::new(
             container_ptr.clone(),
             cv.clone(),
-            do_compact_ptr.clone(),
+            bt_stop_ptr.clone(),
             level_size_factor,
         );
-        let _ = std::thread::spawn(move || compaction_bt.run());
+        let handle = std::thread::spawn(move || compaction_bt.run());
         Ok(SsTable {
             compaction_bt_cv: cv,
             inner: container_ptr,
-            do_compact: do_compact_ptr,
+            bt_stop: bt_stop_ptr,
+            join_handle: Some(handle),
         })
     }
 
@@ -81,15 +84,9 @@ impl SsTable {
     }
 
     pub fn find_and_add_segment(&self, path: PathBuf) -> io::Result<()> {
-        let do_compact: bool;
-        {
-            let mut lock = self.inner.write().unwrap();
-            lock.add_to_level_zero(path)?;
-            do_compact = lock.do_compact();
-        }
-        {
-            let mut lock = self.do_compact.lock().unwrap();
-            *lock = do_compact;
+        let mut lock = self.inner.write().unwrap();
+        lock.add_to_level_zero(path)?;
+        if lock.do_compact() {
             self.compaction_bt_cv.notify_one();
         }
         Ok(())
@@ -252,6 +249,26 @@ impl SsTableEntry {
             }
         }
         res
+    }
+}
+
+impl Drop for SsTable {
+    fn drop(&mut self) {
+        let lock = self.bt_stop.lock();
+        match lock {
+            Err(_) => (),
+            Ok(mut bt_stop) => {
+                *bt_stop = true;
+                self.compaction_bt_cv.notify_one();
+            }
+        }
+        let handle_opt = std::mem::take(&mut self.join_handle);
+        match handle_opt {
+            None => (),
+            Some(handle) => {
+                let _ = handle.join();
+            }
+        }
     }
 }
 

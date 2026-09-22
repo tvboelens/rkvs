@@ -414,6 +414,11 @@ where
                 }
             }
         }
+        let lock = self.table.write().unwrap();
+        if !lock.is_empty() {
+            let _ = self.flusher.flush(&*lock);
+        }
+
         // TODO: regular sync of WAL
     }
 }
