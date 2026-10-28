@@ -187,7 +187,7 @@ impl Worker {
                 Command::Get(key) => self.get(&key),
                 Command::Put(key, value) => self.put(key, value),
             };
-            job.sender.send(res).unwrap_or(())
+            let _ = job.sender.send(res).unwrap_or(());
         }
     }
 
