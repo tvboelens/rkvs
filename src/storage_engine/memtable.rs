@@ -25,12 +25,13 @@ pub struct MemTableValue {
 enum WriteJob {
     Delete(String, Sender<io::Result<Option<MemTableValue>>>),
     Put(String, String, Sender<io::Result<Option<MemTableValue>>>),
+    Shutdown,
 }
 
 pub struct MemTable {
     table: Arc<RwLock<HashMap<String, MemTableValue>>>,
     sender: Sender<WriteJob>,
-    writer_handle: JoinHandle<()>,
+    writer_handle: Option<JoinHandle<()>>,
 }
 
 struct WriteWorker<T>
@@ -108,7 +109,7 @@ impl MemTable {
         MemTable {
             table: table_ptr.clone(),
             sender: tx,
-            writer_handle: handle,
+            writer_handle: Some(handle),
         }
     }
 
@@ -412,6 +413,9 @@ where
                 WriteJob::Put(key, value, sender) => {
                     let _ = sender.send(self.put(key, value));
                 }
+                WriteJob::Shutdown => {
+                    break;
+                }
             }
         }
         let lock = self.table.write().unwrap();
@@ -420,6 +424,19 @@ where
         }
 
         // TODO: regular sync of WAL
+    }
+}
+
+impl Drop for MemTable {
+    fn drop(&mut self) {
+        let _ = self.sender.send(WriteJob::Shutdown);
+        let handle_opt = std::mem::take(&mut self.writer_handle);
+        match handle_opt {
+            None => (),
+            Some(handle) => {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
