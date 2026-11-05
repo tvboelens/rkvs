@@ -31,6 +31,7 @@ pub struct Segment {
     highest_sequence_no: u64,
     size: u64,
     data_block_end: u64,
+    level_number: u64,
     number: u64, // Higher number means newer segment
     first_key: String,
     last_key: String,
@@ -87,9 +88,17 @@ enum IndexSearchResult {
     Range(u64, Option<u64>),
 }
 
+#[derive(Debug)]
+pub enum SegmentOpenError {
+    IoError(io::Error),
+    Corrupted,
+}
+
 impl Segment {
     /// Read a segment from a file
-    pub fn from_file(path: PathBuf) -> io::Result<Self> {
+    pub fn from_file(path: PathBuf) -> Result<Self, SegmentOpenError> {
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        let (level_no, _) = Segment::level_and_segment_number_from_filename(filename);
         let mut rfile = OpenOptions::new()
             .read(true)
             .write(false)
@@ -100,8 +109,7 @@ impl Segment {
         rfile.seek(io::SeekFrom::End(-(SEGMENT_FOOTER_LEN as i64)))?;
         rfile.read_to_end(&mut footer_buf)?;
         if footer_buf[footer_buf.len() - MAGIC_BYTES.len()..] != MAGIC_BYTES {
-            todo!()
-            //return Err(io::Error::from(io::ErrorKind::NotSeekable))
+            return Err(SegmentOpenError::Corrupted);
         }
         let footer = SegmentFooter::from_bytes(
             &footer_buf[0..SEGMENT_FOOTER_LEN as usize - MAGIC_BYTES.len()].to_vec(),
@@ -135,6 +143,7 @@ impl Segment {
             data_block_end: footer.index_offset,
             first_key: first_key,
             last_key: last_key,
+            level_number: level_no,
         })
     }
 
@@ -279,6 +288,10 @@ impl Segment {
         self.filepath.clone()
     }
 
+    pub fn level_number(&self) -> u64 {
+        self.level_number
+    }
+
     /// Returns whether self and the other have overlapping key ranges.
     pub fn overlaps(&self, other: &Segment) -> bool {
         other.first_key <= self.last_key && self.first_key <= other.last_key
@@ -294,6 +307,18 @@ impl Segment {
         padding_bytes.resize(8 - segment_number_hex_str.len(), 48); // "0" = 0x30 = 48
         segment_number_hex_str.insert_str(0, &String::from_utf8(padding_bytes).unwrap());
         level_number_hex_str + &segment_number_hex_str + ".sst"
+    }
+
+    fn level_and_segment_number_from_filename(filename: &str) -> (u64, u64) {
+        let level_number = u64::from_str_radix(&filename[..8], 16).unwrap();
+        let segment_number = u64::from_str_radix(&filename[8..16], 16).unwrap();
+        (level_number, segment_number)
+    }
+}
+
+impl From<io::Error> for SegmentOpenError {
+    fn from(e: io::Error) -> Self {
+        SegmentOpenError::IoError(e)
     }
 }
 

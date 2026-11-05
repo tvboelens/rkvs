@@ -110,17 +110,15 @@ impl Store for StorageEngine {
 
 impl StorageEngine {
     pub fn new(config: StorageEngineConf) -> io::Result<Self> {
+        let sparsity_factor = Arc::new(config.sstable_index_sparsity_factor);
         let sstable = SsTable::start(
             &config.dir.join("SSTable"),
             config.level_zero_size,
             config.level_size_factor,
+            sparsity_factor.clone(),
         )?;
         let sstable_ptr = Arc::new(sstable); // TODO: recover
-        let flusher = Flusher::from(
-            sstable_ptr.clone(),
-            config.dir.clone(),
-            Arc::new(config.sstable_index_sparsity_factor),
-        );
+        let flusher = Flusher::from(sstable_ptr.clone(), config.dir.clone(), sparsity_factor);
         let memtable = memtable::MemTable::start(
             config.dir.join("WAL"),
             config.segment_size,

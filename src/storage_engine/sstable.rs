@@ -31,14 +31,16 @@ impl SsTable {
         dir: &PathBuf,
         level_zero_target_size: u64,
         level_size_factor: u64,
+        index_sparsity_factor: Arc<u32>,
     ) -> io::Result<Self> {
-        /*
-        TODO: detect existing files and do recovery. Depending on recovery create container from
-        existing files or create a new one
-         */
         let bt_stop = false;
         let bt_stop_ptr = Arc::new(Mutex::new(bt_stop));
-        let container = LevelContainer::new(level_zero_target_size);
+        let container = LevelContainer::from_dir(
+            dir,
+            level_zero_target_size,
+            level_size_factor,
+            index_sparsity_factor,
+        )?;
         let container_ptr = Arc::new(RwLock::new(container));
         let cv = Arc::new(Condvar::new());
         let mut compaction_bt = CompactionBt::new(
