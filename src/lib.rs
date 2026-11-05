@@ -48,7 +48,7 @@ impl Server {
         addr: SocketAddr,
         token: CancellationToken,
     ) -> Self {
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let (tx, rx) = tokio::sync::mpsc::channel(1000);
         let connection_manager = ConnectionManager::new(rx, token.clone());
         let handle = tokio::spawn(async move {
             connection_manager.run().await;
