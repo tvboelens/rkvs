@@ -21,7 +21,10 @@ pub trait SstLevel {
     fn exceeds_target_size(&self) -> bool;
     fn highest_segment_number(&self) -> u64;
     fn target_size(&self) -> u64;
-    fn rollback_merge(&mut self) -> io::Result<()>;
+    fn check_merge_status(
+        &self,
+        next_level: &SsTableLevel<PartitionedLevel>,
+    ) -> io::Result<MergeStatus>;
     fn finish_merge(&mut self) -> io::Result<()>;
 }
 
@@ -49,7 +52,7 @@ pub struct LevelContainer {
     partitioned_levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>,
 }
 
-enum MergeStatus {
+pub enum MergeStatus {
     Pending,
     Finish,
     Rollback,
@@ -116,25 +119,39 @@ impl LevelContainer {
         let mut level_zero_segments = Vec::new();
         let mut higher_level_segments = Vec::new();
         let mut higher_levels = Vec::new();
-        let mut curr_level: u64 = 0;
-        for segment in segments {
+        let mut it = segments.into_iter().peekable();
+        while let Some(segment) = it.next() {
             if segment.level_number() == 0 {
                 level_zero_segments.push(Arc::new(segment));
-            } else if curr_level == segment.level_number() {
-                higher_level_segments.push(Arc::new(segment));
-            } else {
-                higher_level_segments
-                    .sort_by(|s1, s2| s1.segment_number().cmp(s2.segment_number()));
-                let level = SsTableLevel::<PartitionedLevel>::from(PartitionedLevel::from(
-                    higher_level_segments.clone(),
-                    level_zero_target_size * curr_level * level_size_factor,
-                    index_sparsity_factor.clone(),
-                    curr_level,
-                ));
-                higher_levels.push(level);
-                curr_level = segment.level_number();
-                higher_level_segments.clear();
-                higher_level_segments.push(Arc::new(segment));
+                continue;
+            }
+            let curr_level_number = segment.level_number();
+            higher_level_segments.push(Arc::new(segment));
+            match it.peek() {
+                Some(next_segment) => {
+                    if next_segment.level_number() > curr_level_number {
+                        higher_level_segments
+                            .sort_by(|s1, s2| s1.segment_number().cmp(s2.segment_number()));
+                        let level = SsTableLevel::<PartitionedLevel>::from(PartitionedLevel::from(
+                            std::mem::take(&mut higher_level_segments),
+                            level_zero_target_size * curr_level_number * level_size_factor,
+                            index_sparsity_factor.clone(),
+                            curr_level_number,
+                        ));
+                        higher_levels.push(level);
+                    }
+                }
+                None => {
+                    higher_level_segments
+                        .sort_by(|s1, s2| s1.segment_number().cmp(s2.segment_number()));
+                    let level = SsTableLevel::<PartitionedLevel>::from(PartitionedLevel::from(
+                        std::mem::take(&mut higher_level_segments),
+                        level_zero_target_size * curr_level_number * level_size_factor,
+                        index_sparsity_factor.clone(),
+                        curr_level_number,
+                    ));
+                    higher_levels.push(level);
+                }
             }
         }
         level_zero_segments.sort_by(|s1, s2| s1.segment_number().cmp(s2.segment_number()));
@@ -146,10 +163,16 @@ impl LevelContainer {
         let mut recovered_higher_levels = Vec::new();
         let mut it = higher_levels.iter_mut().peekable();
         while let Some(level) = it.next() {
+            /* If the current level does not exceed target size, either:
+            1. No merge was pending before last shutdown
+            2. The merge finished writing and deleted all the old segments of this level
+            TODO: even if the current level does not exceed target size, there could be overlapping segments, these
+                  need to be cleaned up as well
+             */
             if !level.exceeds_target_size() {
                 continue;
             }
-            match it.peek() {
+            match it.peek_mut() {
                 None => (), // Perform merge into a new top level later
                 Some(next_level) => match level.check_merge_status(next_level)? {
                     MergeStatus::Pending => (),
@@ -157,7 +180,7 @@ impl LevelContainer {
                         level.finish_merge()?;
                     }
                     MergeStatus::Rollback => {
-                        level.rollback_merge()?;
+                        next_level.rollback_merge()?;
                     }
                 },
             }
@@ -166,12 +189,17 @@ impl LevelContainer {
         let mut segments_to_merge = level_zero.segments_to_merge();
         let mut it = higher_levels.into_iter();
         while let Some(level) = it.next() {
-            let (new_level, segments_to_delete) = level.merge(&segments_to_merge)?;
-            for segment in segments_to_delete {
-                remove_file(segment.filepath())?;
+            if !segments_to_merge.is_empty() {
+                let (new_level, segments_to_delete) = level.merge(&segments_to_merge)?;
+                for segment in segments_to_delete {
+                    remove_file(segment.filepath())?;
+                }
+                segments_to_merge = new_level.segments_to_merge();
+                recovered_higher_levels.push(new_level);
+            } else {
+                segments_to_merge = level.segments_to_merge();
+                recovered_higher_levels.push(Arc::new(level));
             }
-            segments_to_merge = new_level.segments_to_merge();
-            recovered_higher_levels.push(new_level);
         }
         // keep merging until the top level does not exceed target size
         while !segments_to_merge.is_empty() {
@@ -306,7 +334,10 @@ impl SstLevel for OverlappingLevel {
         todo!()
     }
 
-    fn rollback_merge(&mut self) -> io::Result<()> {
+    fn check_merge_status(
+        &self,
+        _next_level: &SsTableLevel<PartitionedLevel>,
+    ) -> io::Result<MergeStatus> {
         todo!()
     }
 }
@@ -358,7 +389,10 @@ impl SstLevel for PartitionedLevel {
         todo!()
     }
 
-    fn rollback_merge(&mut self) -> io::Result<()> {
+    fn check_merge_status(
+        &self,
+        _next_level: &SsTableLevel<PartitionedLevel>,
+    ) -> io::Result<MergeStatus> {
         todo!()
     }
 }
@@ -740,8 +774,11 @@ where
         self.inner.target_size()
     }
 
-    fn rollback_merge(&mut self) -> io::Result<()> {
-        self.inner.rollback_merge()
+    fn check_merge_status(
+        &self,
+        next_level: &SsTableLevel<PartitionedLevel>,
+    ) -> io::Result<MergeStatus> {
+        self.inner.check_merge_status(next_level)
     }
 
     fn finish_merge(&mut self) -> io::Result<()> {
@@ -785,10 +822,7 @@ impl SsTableLevel<PartitionedLevel> {
         self.inner.level_number
     }
 
-    fn check_merge_status(
-        &self,
-        _next_level: &SsTableLevel<PartitionedLevel>,
-    ) -> io::Result<MergeStatus> {
+    fn rollback_merge(&mut self) -> io::Result<()> {
         todo!()
     }
 }
@@ -815,13 +849,6 @@ impl SsTableLevel<OverlappingLevel> {
             }
         }
         res
-    }
-
-    fn check_merge_status(
-        &self,
-        _next_level: &SsTableLevel<OverlappingLevel>,
-    ) -> io::Result<MergeStatus> {
-        todo!()
     }
 }
 
@@ -855,6 +882,30 @@ mod tests {
     impl Drop for Cleanup {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    impl Segment {
+        fn from_entries(
+            entries: &Vec<SsTableEntry>,
+            dir: &PathBuf,
+            level_number: &u64,
+            segment_number: &u64,
+            index_sparsity_factor: u32,
+        ) -> Result<Self, SegmentOpenError> {
+            let mut writer = SegmentWriter::create_new_segment(
+                dir,
+                level_number,
+                segment_number,
+                index_sparsity_factor,
+            )?;
+
+            for entry in entries {
+                writer.write_entry(&entry).unwrap();
+            }
+            writer.write_index_and_footer().unwrap();
+
+            Segment::from_file(writer.filepath().clone())
         }
     }
 
@@ -1087,6 +1138,86 @@ mod tests {
                 || segments_to_delete.last().unwrap().filepath() == fp1
         );
     }
+
+    #[test]
+    fn container_from_dir_two_higher_levels_no_merge() {
+        let dir = PathBuf::from("./container_from_dir_two_higher_levels_no_merge");
+        let cl = Cleanup { dir: dir.clone() };
+        assert!(cl.setup().is_ok());
+
+        let entries_1_1 = vec![
+            SsTableEntry {
+                key: String::from("key1"),
+                value: Some(String::from("value1")),
+                sequence_number: 5,
+            },
+            SsTableEntry {
+                key: String::from("key2"),
+                value: Some(String::from("value2")),
+                sequence_number: 6,
+            },
+        ];
+        let segment1_level1 = Segment::from_entries(&entries_1_1, &dir, &1, &1, 1).unwrap();
+        assert_eq!(*segment1_level1.segment_number(), 1);
+        assert_eq!(segment1_level1.level_number(), 1);
+        assert_eq!(segment1_level1.highest_sequence_number(), 6);
+
+        let entries_1_2 = vec![
+            SsTableEntry {
+                key: String::from("key3"),
+                value: Some(String::from("value3")),
+                sequence_number: 7,
+            },
+            SsTableEntry {
+                key: String::from("key4"),
+                value: Some(String::from("value4")),
+                sequence_number: 8,
+            },
+        ];
+        let segment2_level1 = Segment::from_entries(&entries_1_2, &dir, &1, &2, 1).unwrap();
+        assert_eq!(*segment2_level1.segment_number(), 2);
+        assert_eq!(segment2_level1.level_number(), 1);
+        assert_eq!(segment2_level1.highest_sequence_number(), 8);
+
+        let entries_2_1 = vec![
+            SsTableEntry {
+                key: String::from("key1"),
+                value: Some(String::from("value1")),
+                sequence_number: 1,
+            },
+            SsTableEntry {
+                key: String::from("key2"),
+                value: Some(String::from("value2")),
+                sequence_number: 2,
+            },
+        ];
+        let segment1_level2 = Segment::from_entries(&entries_2_1, &dir, &2, &1, 1).unwrap();
+        assert_eq!(*segment1_level2.segment_number(), 1);
+        assert_eq!(segment1_level2.level_number(), 2);
+        assert_eq!(segment1_level2.highest_sequence_number(), 2);
+
+        let entries_2_2 = vec![
+            SsTableEntry {
+                key: String::from("key4"),
+                value: None,
+                sequence_number: 3,
+            },
+            SsTableEntry {
+                key: String::from("key5"),
+                value: Some(String::from("value5")),
+                sequence_number: 4,
+            },
+        ];
+        let segment2_level2 = Segment::from_entries(&entries_2_2, &dir, &2, &2, 10).unwrap();
+        assert_eq!(*segment2_level2.segment_number(), 2);
+        assert_eq!(segment2_level2.level_number(), 2);
+        assert_eq!(segment2_level2.highest_sequence_number(), 4);
+
+        let container = LevelContainer::from_dir(&dir, 1024, 10, 10.into()).unwrap();
+        assert_eq!(container.partitioned_levels.len(), 2);
+        assert_eq!(container.partitioned_levels[0].inner.segments.len(), 2);
+        assert_eq!(container.partitioned_levels[1].inner.segments.len(), 2);
+    }
 }
 
 /*
@@ -1099,4 +1230,10 @@ Testing
     3. Add impl for SsTable (or segment) so that we can input a vector of sstable entries
        (and some other data like level, segment number etc) to create an sstable segment
        or just a whole sstable. This will also come in handy once we want to test recovery
+    1. from dir
+        1. no level 0, level 1 and level 2
+            1. level 1 and level 2 both ok no merge needed
+            2. level 1 ok, level 2 too large -> merge into level 3
+            3.
+        2. level 0, level 1 and level 2
 */
