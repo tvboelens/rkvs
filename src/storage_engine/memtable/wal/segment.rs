@@ -70,12 +70,18 @@ pub fn determine_segment_filename(
     let mut padding_bytes = Vec::<u8>::new();
     let mut timeline_hex_str = format!("{:x}", timeline);
     padding_bytes.resize(8 - timeline_hex_str.len(), 48); // "0" = 0x30 = 48
-    timeline_hex_str.insert_str(0, &String::from_utf8(padding_bytes.clone()).unwrap());
+    timeline_hex_str.insert_str(
+        0,
+        &String::from_utf8(std::mem::take(&mut padding_bytes)).unwrap(),
+    );
     // logical log is 4GB = 2^32 bytes, hence the number of the logical
     // log containing this sequence number is the first 8 bytes (32 bits)
     let mut sequence_number_hex_str = format!("{:x}", sequence_number);
     padding_bytes.resize(16 - sequence_number_hex_str.len(), 48);
-    sequence_number_hex_str.insert_str(0, &String::from_utf8(padding_bytes.clone()).unwrap());
+    sequence_number_hex_str.insert_str(
+        0,
+        &String::from_utf8(std::mem::take(&mut padding_bytes)).unwrap(),
+    );
     let two: u64 = 2;
     let segment_no = sequence_number % two.pow(32) / *segment_size as u64;
     let mut segment_size_hex_str = format!("{:x}", segment_no);

@@ -126,17 +126,17 @@ impl Segment {
             None => 0,
             Some(idx) => idx.offset,
         };
-        let entries = Segment::read_table_entries(&rfile, start, footer.index_offset)?;
-        let last_key = match entries.last() {
-            None => first_key.clone(),
-            Some(entry) => entry.key.to_owned(),
-        };
+        let mut entries = Segment::read_table_entries(&rfile, start, footer.index_offset)?;
         let mut highest_sequence_no = 0;
         for entry in &entries {
             if entry.sequence_number > highest_sequence_no {
                 highest_sequence_no = entry.sequence_number;
             }
         }
+        let last_key = match entries.last_mut() {
+            None => first_key.clone(),
+            Some(entry) => std::mem::take(&mut entry.key),
+        };
         Ok(Segment {
             file: rfile,
             filepath: path,
