@@ -98,7 +98,7 @@ impl Segment {
     /// Read a segment from a file
     pub fn from_file(path: PathBuf) -> Result<Self, SegmentOpenError> {
         let filename = path.file_name().unwrap().to_str().unwrap();
-        let (level_no, _) = Segment::level_and_segment_number_from_filename(filename);
+        let (level_no, segment_no) = Segment::level_and_segment_number_from_filename(filename);
         let mut rfile = OpenOptions::new()
             .read(true)
             .write(false)
@@ -131,15 +131,19 @@ impl Segment {
             None => first_key.clone(),
             Some(entry) => entry.key.to_owned(),
         };
-        let highest_sequence_no = 0; // TODO
-        let segment_number = 0; // TODO: from filename
+        let mut highest_sequence_no = 0;
+        for entry in &entries {
+            if entry.sequence_number > highest_sequence_no {
+                highest_sequence_no = entry.sequence_number;
+            }
+        }
         Ok(Segment {
             file: rfile,
             filepath: path,
             highest_sequence_no: highest_sequence_no,
             index: index,
             size: metadata.size(),
-            number: segment_number,
+            number: segment_no,
             data_block_end: footer.index_offset,
             first_key: first_key,
             last_key: last_key,
@@ -798,6 +802,9 @@ mod tests {
         let segment = Segment::from_file(fp).unwrap();
         assert_eq!(segment.first_key, String::from("key"));
         assert_eq!(segment.last_key, String::from("key"));
+        assert_eq!(segment.level_number(), 0);
+        assert_eq!(segment.highest_sequence_number(), 2);
+        assert_eq!(*segment.segment_number(), sequence_number as u64);
         let value = segment.get(&String::from("key")).unwrap();
         assert!(value.is_some());
         let entry = SsTableEntry::from(
