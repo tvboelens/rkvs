@@ -16,23 +16,49 @@ pub mod segment;
 static MERGE_BUF_MAX_TOTAL_SIZE: u64 = 1024 * 1024 * 10; // 10 MB
 
 pub trait SstLevel {
+    /// Searches all the segments in the level for the entry.
+    /// If multiple entries are found with the key, returns the
+    /// newest entry, i.e. the one with the highest sequence number.
     fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>>;
+    /// If the level exceeds target size, this method returns all
+    /// segments that should be merged into the next level.
+    /// In the current version we choose segments from old to new
+    /// until the level does not exceed target size anymore.
     fn segments_to_merge(&self) -> Vec<Arc<Segment>>;
+    /// Every level has a target size. If the target size is exceeded,
+    /// this means segments have to be merged into the next level.
+    /// This function signifies whether target size has been exceeded.
     fn exceeds_target_size(&self) -> bool;
+    /// We number the segment files from old to new. This function returns
+    /// the highest segment number of the current level, i,e. the number of
+    /// the newest segment contained in this level.
     fn highest_segment_number(&self) -> u64;
+    /// Returns the target size for the level. Once a level reaches target size,
+    /// it should be compacted.
     fn target_size(&self) -> u64;
+    /// Checks whether previous merge into `next_level` has been succesfully completed.
+    /// Used during startup/recovery.
     fn check_merge_status(
         &self,
         next_level: &SsTableLevel<PartitionedLevel>,
     ) -> io::Result<MergeStatus>;
+    /// Finish an interrupted merge. Should only be called if [`SstLevel::check_merge_status`] returns
+    /// [`MergeStatus::Finish`]
     fn finish_merge(&mut self) -> io::Result<()>;
 }
 
+/// The struct for level zero of the SSTable.
+/// Internally contains the list of SSTable segments,
+/// which are allowed to have overlapping key ranges.
 #[derive(Clone)]
 pub struct OverlappingLevel {
     segments: Vec<Arc<Segment>>,
     target_size: u64,
 }
+
+/// The struct for higher levels of the SSTable.
+/// Internally contains the list of SSTable segments,
+/// which have disjoint key ranges.
 pub struct PartitionedLevel {
     segments: Vec<Arc<Segment>>,
     target_size: u64,
@@ -40,6 +66,7 @@ pub struct PartitionedLevel {
     level_number: u64,
 }
 
+/// Wrapper struct around either level zero or a higher level.
 pub struct SsTableLevel<T>
 where
     T: SstLevel,
@@ -47,11 +74,17 @@ where
     inner: T,
 }
 
+/// Container struct that contains the current snapshot of
+/// the SSTable. Every worker reading from the SSTable receives
+/// a copy of the current snapshot from which it reads.
+/// The snapshot is updated every time background compaction
+/// is performed.
 pub struct LevelContainer {
     level_zero: Arc<SsTableLevel<OverlappingLevel>>,
     partitioned_levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>,
 }
 
+/// Result type of [`SstLevel::check_merge_status`]
 pub enum MergeStatus {
     Pending,
     Finish,
@@ -59,6 +92,8 @@ pub enum MergeStatus {
 }
 
 impl LevelContainer {
+    /// Creates a new container with no higher levels and level zero
+    /// with no segments.
     fn new(level_zero_target_size: u64) -> Self {
         let level = OverlappingLevel {
             segments: Vec::new(),
@@ -128,7 +163,11 @@ impl LevelContainer {
             let curr_level_number = segment.level_number();
             higher_level_segments.push(Arc::new(segment));
             match it.peek() {
+                // Check if we have reached the last segment of current level
+                // and if so, create the level and push it onto higher_levels
                 Some(next_segment) => {
+                    // TODO: this is a place where we could check if there is a gap
+                    // Question is if we should panic or just remove all the following segments
                     if next_segment.level_number() > curr_level_number {
                         higher_level_segments
                             .sort_by(|s1, s2| s1.segment_number().cmp(s2.segment_number()));
@@ -221,14 +260,17 @@ impl LevelContainer {
         })
     }
 
+    /// Gives the caller (read only) access to level zero.
     pub fn level_zero(&self) -> Arc<SsTableLevel<OverlappingLevel>> {
         self.level_zero.clone()
     }
 
+    /// Gives the caller (read only) access to the higher levels.
     pub fn partitioned_levels(&self) -> Vec<Arc<SsTableLevel<PartitionedLevel>>> {
         self.partitioned_levels.clone()
     }
 
+    /// Swaps out the higher levels. Used during background compaction.
     pub fn swap_partitioned_levels(
         &mut self,
         new_partitioned_levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>,
@@ -236,6 +278,7 @@ impl LevelContainer {
         self.partitioned_levels = new_partitioned_levels;
     }
 
+    /// Swaps out all levels. Used during background compaction.
     pub fn swap_all_levels(
         &mut self,
         new_partitioned_levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>,
@@ -245,6 +288,11 @@ impl LevelContainer {
         self.partitioned_levels = new_partitioned_levels;
     }
 
+    /// Finds an sstable segment file at path, opens it and adds it to level zero.
+    /// This is called when flushing the memtable to disk.
+    /// Panics if the segment is corrupted (i.e. misses magic bytes at the end),
+    /// since corruption should only happen in case of a programming error:
+    /// this function is called only after startup, during which corrupted files are removed.
     pub fn add_to_level_zero(&mut self, path: PathBuf) -> io::Result<()> {
         let segment: Segment;
         match Segment::from_file(path) {
@@ -266,15 +314,13 @@ impl LevelContainer {
         Ok(())
     }
 
+    /// Function that signifies whether a compaction job should be started.
     pub fn do_compact(&self) -> bool {
         self.level_zero.exceeds_target_size()
     }
 }
 
 impl SstLevel for OverlappingLevel {
-    /// Searches all the segments in the level for the entry.
-    /// If multiple entries are found with the key, returns the
-    /// newest entry, i.e. the one with the highest sequence number.
     fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>> {
         let mut curr_entry = None;
         for segment in &self.segments {
@@ -425,7 +471,7 @@ impl PartitionedLevel {
         }
     }
 
-    pub fn highest_segment_number(&self) -> u64 {
+    fn highest_segment_number(&self) -> u64 {
         let mut res = 0;
         for segment in &self.segments {
             if *segment.segment_number() > res {
