@@ -227,7 +227,7 @@ impl LevelContainer {
         // Execute merges if needed
         let mut segments_to_merge = level_zero.segments_to_merge();
         let mut it = higher_levels.into_iter();
-        while let Some(level) = it.next() {
+        while let Some(mut level) = it.next() {
             if !segments_to_merge.is_empty() {
                 let (new_level, segments_to_delete) = level.merge(&segments_to_merge)?;
                 for segment in segments_to_delete {
@@ -237,6 +237,7 @@ impl LevelContainer {
                 recovered_higher_levels.push(new_level);
             } else {
                 segments_to_merge = level.segments_to_merge();
+                level.shrink_to_target_size();
                 recovered_higher_levels.push(Arc::new(level));
             }
         }
@@ -351,8 +352,8 @@ impl SstLevel for OverlappingLevel {
                     segments_to_merge.push(segment.clone());
                     size -= segment.size();
                 }
-                curr_segment_number -= 1;
             }
+            curr_segment_number -= 1;
         }
         segments_to_merge
     }
@@ -406,8 +407,8 @@ impl SstLevel for PartitionedLevel {
                     segments_to_merge.push(segment.clone());
                     size -= segment.size();
                 }
-                curr_segment_number -= 1;
             }
+            curr_segment_number -= 1;
         }
         segments_to_merge
     }
@@ -437,9 +438,65 @@ impl SstLevel for PartitionedLevel {
 
     fn check_merge_status(
         &self,
-        _next_level: &SsTableLevel<PartitionedLevel>,
+        next_level: &SsTableLevel<PartitionedLevel>,
     ) -> io::Result<MergeStatus> {
-        todo!()
+        if !self.exceeds_target_size() {
+            panic!("check_merge_status called, but level does not exceed target size!");
+        }
+        /*
+        1. all (key, sequence_no) pairs of segments to merge are in next level -> compaction is finished
+        2. not all are in next level -> compaction was interrupted
+        3. none are in next level -> compaction not started
+        */
+        let mut found = false;
+        let mut not_found = false;
+        let total_size = self.segments.iter().map(|segment| segment.size()).sum();
+        let mut segment_size_checked = 0;
+        let mut it = self.segments_to_merge().into_iter();
+        while let Some(segment) = it.next() {
+            if segment_size_checked + self.target_size > total_size {
+                break;
+            }
+            let entries = segment.read_at_most(&0, &segment.size())?;
+            for entry in &entries {
+                let mut containing_segment_exists = false;
+                for nl_segment in &next_level.inner.segments {
+                    if *nl_segment.first_key() <= entry.key && entry.key <= *nl_segment.last_key() {
+                        match nl_segment.get(&entry.key)? {
+                            Some(nl_entry) => {
+                                if (*entry == nl_entry && not_found) || *entry != nl_entry && found
+                                {
+                                    return Ok(MergeStatus::Rollback);
+                                } else if *entry != nl_entry {
+                                    not_found = true;
+                                } else {
+                                    found = true;
+                                    containing_segment_exists = true;
+                                }
+                            }
+                            None => {
+                                if found {
+                                    return Ok(MergeStatus::Rollback);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !containing_segment_exists {
+                    if found {
+                        return Ok(MergeStatus::Rollback);
+                    } else {
+                        not_found = true;
+                    }
+                }
+            }
+            segment_size_checked += segment.size();
+        }
+        if found {
+            Ok(MergeStatus::Finish)
+        } else {
+            Ok(MergeStatus::Pending)
+        }
     }
 }
 
@@ -871,6 +928,25 @@ impl SsTableLevel<PartitionedLevel> {
     fn rollback_merge(&mut self) -> io::Result<()> {
         todo!()
     }
+
+    /// Removes the oldest segments until target size is not exceeded
+    fn shrink_to_target_size(&mut self) -> () {
+        // sort so that we can pop from the back
+        self.inner
+            .segments
+            .sort_by(|s1, s2| s2.segment_number().cmp(s1.segment_number()));
+        loop {
+            if !self.exceeds_target_size() {
+                break;
+            } else {
+                let _ = self.inner.segments.pop();
+            }
+        }
+        // TODO: sort by segment number or by first key?
+        self.inner
+            .segments
+            .sort_by(|s1, s2| s1.segment_number().cmp(s2.segment_number()));
+    }
 }
 
 impl SsTableLevel<OverlappingLevel> {
@@ -1263,6 +1339,199 @@ mod tests {
         assert_eq!(container.partitioned_levels.len(), 2);
         assert_eq!(container.partitioned_levels[0].inner.segments.len(), 2);
         assert_eq!(container.partitioned_levels[1].inner.segments.len(), 2);
+    }
+
+    #[test]
+    fn container_from_dir_two_higher_levels_merge() {
+        /*
+        entry: {key, value, sequence_number}
+        level 1: {{key1, value1, 5}, {key2, value2, 6}}, {{key3, value3, 7}, {key4, value4, 8}}
+        level 2: {{key1, value1, 1}, {key2, value2, 2}}, {{key4, None, 3}, {key5, value5, 4}}
+
+        new level 1: {{key3, value3, 7}, {key4, value4, 8}}
+        new level 2: {{key1, value1, 5}, {key2, value2, 6}}, {{key4, None, 3}, {key5, value5, 4}}
+         */
+        let dir = PathBuf::from("./container_from_dir_two_higher_levels_merge");
+        let cl = Cleanup { dir: dir.clone() };
+        assert!(cl.setup().is_ok());
+
+        let entries_1_1 = vec![
+            SsTableEntry {
+                key: String::from("key1"),
+                value: Some(String::from("value1")),
+                sequence_number: 5,
+            },
+            SsTableEntry {
+                key: String::from("key2"),
+                value: Some(String::from("value2")),
+                sequence_number: 6,
+            },
+        ];
+        let segment1_level1 = Segment::from_entries(&entries_1_1, &dir, &1, &1, 1).unwrap();
+        assert_eq!(*segment1_level1.segment_number(), 1);
+        assert_eq!(segment1_level1.level_number(), 1);
+        assert_eq!(segment1_level1.highest_sequence_number(), 6);
+
+        let entries_1_2 = vec![
+            SsTableEntry {
+                key: String::from("key3"),
+                value: Some(String::from("value3")),
+                sequence_number: 7,
+            },
+            SsTableEntry {
+                key: String::from("key4"),
+                value: Some(String::from("value4")),
+                sequence_number: 8,
+            },
+        ];
+        let segment2_level1 = Segment::from_entries(&entries_1_2, &dir, &1, &2, 1).unwrap();
+        assert_eq!(*segment2_level1.segment_number(), 2);
+        assert_eq!(segment2_level1.level_number(), 1);
+        assert_eq!(segment2_level1.highest_sequence_number(), 8);
+
+        let entries_2_1 = vec![
+            SsTableEntry {
+                key: String::from("key1"),
+                value: Some(String::from("value1")),
+                sequence_number: 1,
+            },
+            SsTableEntry {
+                key: String::from("key2"),
+                value: Some(String::from("value2")),
+                sequence_number: 2,
+            },
+        ];
+        let segment1_level2 = Segment::from_entries(&entries_2_1, &dir, &2, &1, 1).unwrap();
+        assert_eq!(*segment1_level2.segment_number(), 1);
+        assert_eq!(segment1_level2.level_number(), 2);
+        assert_eq!(segment1_level2.highest_sequence_number(), 2);
+
+        let entries_2_2 = vec![
+            SsTableEntry {
+                key: String::from("key4"),
+                value: None,
+                sequence_number: 3,
+            },
+            SsTableEntry {
+                key: String::from("key5"),
+                value: Some(String::from("value5")),
+                sequence_number: 4,
+            },
+        ];
+        let segment2_level2 = Segment::from_entries(&entries_2_2, &dir, &2, &2, 10).unwrap();
+        assert_eq!(*segment2_level2.segment_number(), 2);
+        assert_eq!(segment2_level2.level_number(), 2);
+        assert_eq!(segment2_level2.highest_sequence_number(), 4);
+
+        let target_size = (segment1_level1.size() + segment2_level1.size() - 10) / 2;
+        println!(
+            "level 1 target size = {}, level 1 size = {}",
+            target_size * 2,
+            segment1_level1.size() + segment2_level1.size()
+        );
+        println!(
+            "level 2 target size = {}, level 2 size = {}",
+            target_size * 4,
+            segment1_level2.size() + segment2_level2.size()
+        );
+        let container = LevelContainer::from_dir(&dir, target_size, 2, 10.into()).unwrap();
+        assert_eq!(container.partitioned_levels.len(), 2);
+        assert_eq!(container.partitioned_levels[0].inner.segments.len(), 1);
+        assert_eq!(container.partitioned_levels[1].inner.segments.len(), 2);
+    }
+
+    #[test]
+    fn check_merge_status_pending() {
+        let dir = PathBuf::from("./check_merge_status_pending");
+        let cl = Cleanup { dir: dir.clone() };
+        assert!(cl.setup().is_ok());
+
+        let entries_1_1 = vec![
+            SsTableEntry {
+                key: String::from("key1"),
+                value: Some(String::from("value1")),
+                sequence_number: 5,
+            },
+            SsTableEntry {
+                key: String::from("key2"),
+                value: Some(String::from("value2")),
+                sequence_number: 6,
+            },
+        ];
+        let segment1_level1 = Segment::from_entries(&entries_1_1, &dir, &1, &1, 1).unwrap();
+        assert_eq!(*segment1_level1.segment_number(), 1);
+        assert_eq!(segment1_level1.level_number(), 1);
+        assert_eq!(segment1_level1.highest_sequence_number(), 6);
+
+        let entries_1_2 = vec![
+            SsTableEntry {
+                key: String::from("key3"),
+                value: Some(String::from("value3")),
+                sequence_number: 7,
+            },
+            SsTableEntry {
+                key: String::from("key4"),
+                value: Some(String::from("value4")),
+                sequence_number: 8,
+            },
+        ];
+        let segment2_level1 = Segment::from_entries(&entries_1_2, &dir, &1, &2, 1).unwrap();
+        assert_eq!(*segment2_level1.segment_number(), 2);
+        assert_eq!(segment2_level1.level_number(), 1);
+        assert_eq!(segment2_level1.highest_sequence_number(), 8);
+
+        let entries_2_1 = vec![
+            SsTableEntry {
+                key: String::from("key1"),
+                value: Some(String::from("value1")),
+                sequence_number: 1,
+            },
+            SsTableEntry {
+                key: String::from("key2"),
+                value: Some(String::from("value2")),
+                sequence_number: 2,
+            },
+        ];
+        let segment1_level2 = Segment::from_entries(&entries_2_1, &dir, &2, &1, 1).unwrap();
+        assert_eq!(*segment1_level2.segment_number(), 1);
+        assert_eq!(segment1_level2.level_number(), 2);
+        assert_eq!(segment1_level2.highest_sequence_number(), 2);
+
+        let entries_2_2 = vec![
+            SsTableEntry {
+                key: String::from("key4"),
+                value: None,
+                sequence_number: 3,
+            },
+            SsTableEntry {
+                key: String::from("key5"),
+                value: Some(String::from("value5")),
+                sequence_number: 4,
+            },
+        ];
+        let segment2_level2 = Segment::from_entries(&entries_2_2, &dir, &2, &2, 10).unwrap();
+        assert_eq!(*segment2_level2.segment_number(), 2);
+        assert_eq!(segment2_level2.level_number(), 2);
+        assert_eq!(segment2_level2.highest_sequence_number(), 4);
+
+        let target_size = (segment1_level1.size() + segment2_level1.size() - 10) / 2;
+        let level1 = SsTableLevel::from(PartitionedLevel::from(
+            vec![Arc::new(segment1_level1), Arc::new(segment2_level1)],
+            target_size,
+            Arc::new(10),
+            1,
+        ));
+
+        let level2 = SsTableLevel::from(PartitionedLevel::from(
+            vec![Arc::new(segment1_level2), Arc::new(segment2_level2)],
+            target_size * 2,
+            10.into(),
+            2,
+        ));
+        assert!(matches!(
+            level1.check_merge_status(&level2),
+            Ok(MergeStatus::Pending)
+        ))
     }
 }
 
