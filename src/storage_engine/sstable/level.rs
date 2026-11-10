@@ -436,7 +436,24 @@ impl SstLevel for PartitionedLevel {
     }
 
     fn finish_merge(&mut self) -> io::Result<()> {
-        todo!()
+        // sort so that we can pop from the back
+        self.segments
+            .sort_by(|s1, s2| s2.segment_number().cmp(s1.segment_number()));
+        loop {
+            if !self.exceeds_target_size() {
+                break;
+            } else {
+                match self.segments.pop() {
+                    None => (),
+                    Some(segment) => {
+                        let _ = std::fs::remove_file(segment.filepath())?;
+                    }
+                }
+            }
+        }
+        self.segments
+            .sort_by(|s1, s2| s1.segment_number().cmp(s2.segment_number()));
+        Ok(())
     }
 
     fn check_merge_status(
@@ -1502,13 +1519,16 @@ mod tests {
     fn container_from_dir_two_higher_levels_merge_status_finish() {
         /*
         entry: {key, value, sequence_number}, segments ordered by number
-        level 1: {{key1, value1, 1}, {key2, value2, 2}}, {{key3, value3, 7}, {key4, value4, 8}}
-        level 2: {{key1, value1, 1}, {key2, value2, 2}, {key3, value3, 3}}, {{key4, None, 4}, {key5, value5, 5}}
+        level 1: {{key1, value1, 1}, {key2, value2, 2}},
+                 {{key3, value3, 7}, {key4, value4, 8}}
+        level 2: {{key1, value1, 1}, {key2, value2, 2}, {key3, value3, 3}},
+                 {{key4, None, 4}, {key5, value5, 5}}
 
         Segment 1 of level 1 is to be merged -> finish
 
         new level 1: {{key3, value3, 7}, {key4, value4, 8}}
-        new level 2: {{key1, value1, 1}, {key2, value2, 2}, {key3, value3, 3}}, {{key4, None, 4}, {key5, value5, 5}}
+        new level 2: {{key1, value1, 1}, {key2, value2, 2}, {key3, value3, 3}},
+                     {{key4, None, 4}, {key5, value5, 5}}
         */
         let dir = PathBuf::from("./container_from_dir_two_higher_levels_merge_status_finish");
         let cl = Cleanup { dir: dir.clone() };
@@ -1655,12 +1675,12 @@ mod tests {
             SsTableEntry {
                 key: String::from("key4"),
                 value: None,
-                sequence_number: 3,
+                sequence_number: 4,
             },
             SsTableEntry {
                 key: String::from("key5"),
                 value: Some(String::from("value5")),
-                sequence_number: 4,
+                sequence_number: 5,
             },
         ]
         .into();
