@@ -233,8 +233,11 @@ impl LevelContainer {
                 for segment in segments_to_delete {
                     remove_file(segment.filepath())?;
                 }
+                // TODO: this does not seem correct: if new level exceeds target size,
+                // then it should not be pushed yet onto recovered_higher_levels
+                // or at the least we should replace that level in the next iteration
                 segments_to_merge = new_level.segments_to_merge();
-                recovered_higher_levels.push(new_level);
+                recovered_higher_levels.push(Arc::new(new_level));
             } else {
                 segments_to_merge = level.segments_to_merge();
                 level.shrink_to_target_size();
@@ -253,7 +256,7 @@ impl LevelContainer {
                 remove_file(segment.filepath())?;
             }
             segments_to_merge = new_level.segments_to_merge();
-            recovered_higher_levels.push(new_level);
+            recovered_higher_levels.push(Arc::new(new_level));
         }
         Ok(LevelContainer {
             level_zero: Arc::new(level_zero),
@@ -400,15 +403,15 @@ impl SstLevel for PartitionedLevel {
     fn segments_to_merge(&self) -> Vec<Arc<Segment>> {
         let mut segments_to_merge = Vec::new();
         let mut size: u64 = self.segments.iter().map(|s| s.size()).sum();
-        let mut curr_segment_number = self.highest_segment_number();
-        while size > self.target_size {
+        let mut curr_segment_number = 0;
+        while size > self.target_size && curr_segment_number <= self.highest_segment_number() {
             for segment in &self.segments {
                 if *segment.segment_number() == curr_segment_number {
                     segments_to_merge.push(segment.clone());
                     size -= segment.size();
                 }
             }
-            curr_segment_number -= 1;
+            curr_segment_number += 1;
         }
         segments_to_merge
     }
@@ -450,13 +453,8 @@ impl SstLevel for PartitionedLevel {
         */
         let mut found = false;
         let mut not_found = false;
-        let total_size = self.segments.iter().map(|segment| segment.size()).sum();
-        let mut segment_size_checked = 0;
         let mut it = self.segments_to_merge().into_iter();
         while let Some(segment) = it.next() {
-            if segment_size_checked + self.target_size > total_size {
-                break;
-            }
             let entries = segment.read_at_most(&0, &segment.size())?;
             for entry in &entries {
                 let mut containing_segment_exists = false;
@@ -490,7 +488,6 @@ impl SstLevel for PartitionedLevel {
                     }
                 }
             }
-            segment_size_checked += segment.size();
         }
         if found {
             Ok(MergeStatus::Finish)
@@ -544,7 +541,7 @@ impl PartitionedLevel {
     fn merge(
         &self,
         incoming_segments: &Vec<Arc<Segment>>,
-    ) -> io::Result<(Arc<SsTableLevel<PartitionedLevel>>, Vec<Arc<Segment>>)> {
+    ) -> io::Result<(SsTableLevel<PartitionedLevel>, Vec<Arc<Segment>>)> {
         let mut segments = Vec::new();
         let mut untouched_segments = Vec::new();
         for segment in &self.segments {
@@ -573,10 +570,7 @@ impl PartitionedLevel {
             index_sparsity_factor: self.index_sparsity_factor.clone(),
             level_number: self.level_number,
         };
-        Ok((
-            Arc::new(SsTableLevel::<PartitionedLevel>::from(new_level)),
-            segments,
-        ))
+        Ok((SsTableLevel::<PartitionedLevel>::from(new_level), segments))
     }
 
     fn merge_and_write(&self, segments: &Vec<Arc<Segment>>) -> io::Result<Vec<Arc<Segment>>> {
@@ -917,7 +911,7 @@ impl SsTableLevel<PartitionedLevel> {
     pub fn merge(
         &self,
         segments: &Vec<Arc<Segment>>,
-    ) -> io::Result<(Arc<SsTableLevel<PartitionedLevel>>, Vec<Arc<Segment>>)> {
+    ) -> io::Result<(SsTableLevel<PartitionedLevel>, Vec<Arc<Segment>>)> {
         self.inner.merge(segments)
     }
 
@@ -930,7 +924,7 @@ impl SsTableLevel<PartitionedLevel> {
     }
 
     /// Removes the oldest segments until target size is not exceeded
-    fn shrink_to_target_size(&mut self) -> () {
+    pub fn shrink_to_target_size(&mut self) -> () {
         // sort so that we can pop from the back
         self.inner
             .segments
@@ -1342,16 +1336,18 @@ mod tests {
     }
 
     #[test]
-    fn container_from_dir_two_higher_levels_merge() {
+    fn container_from_dir_two_higher_levels_merge_status_pending() {
         /*
-        entry: {key, value, sequence_number}
+        entry: {key, value, sequence_number}, segments ordered by number
         level 1: {{key1, value1, 5}, {key2, value2, 6}}, {{key3, value3, 7}, {key4, value4, 8}}
         level 2: {{key1, value1, 1}, {key2, value2, 2}}, {{key4, None, 3}, {key5, value5, 4}}
 
+        Segment 1 of level 1 is to be merged -> pending
+
         new level 1: {{key3, value3, 7}, {key4, value4, 8}}
         new level 2: {{key1, value1, 5}, {key2, value2, 6}}, {{key4, None, 3}, {key5, value5, 4}}
-         */
-        let dir = PathBuf::from("./container_from_dir_two_higher_levels_merge");
+        */
+        let dir = PathBuf::from("./container_from_dir_two_higher_levels_merge_status_pending");
         let cl = Cleanup { dir: dir.clone() };
         assert!(cl.setup().is_ok());
 
@@ -1423,104 +1419,14 @@ mod tests {
         assert_eq!(segment2_level2.level_number(), 2);
         assert_eq!(segment2_level2.highest_sequence_number(), 4);
 
-        let target_size = (segment1_level1.size() + segment2_level1.size() - 10) / 2;
-        println!(
-            "level 1 target size = {}, level 1 size = {}",
-            target_size * 2,
-            segment1_level1.size() + segment2_level1.size()
-        );
-        println!(
-            "level 2 target size = {}, level 2 size = {}",
-            target_size * 4,
-            segment1_level2.size() + segment2_level2.size()
-        );
-        let container = LevelContainer::from_dir(&dir, target_size, 2, 10.into()).unwrap();
-        assert_eq!(container.partitioned_levels.len(), 2);
-        assert_eq!(container.partitioned_levels[0].inner.segments.len(), 1);
-        assert_eq!(container.partitioned_levels[1].inner.segments.len(), 2);
-    }
-
-    #[test]
-    fn check_merge_status_pending() {
-        let dir = PathBuf::from("./check_merge_status_pending");
-        let cl = Cleanup { dir: dir.clone() };
-        assert!(cl.setup().is_ok());
-
-        let entries_1_1 = vec![
-            SsTableEntry {
-                key: String::from("key1"),
-                value: Some(String::from("value1")),
-                sequence_number: 5,
-            },
-            SsTableEntry {
-                key: String::from("key2"),
-                value: Some(String::from("value2")),
-                sequence_number: 6,
-            },
-        ];
-        let segment1_level1 = Segment::from_entries(&entries_1_1, &dir, &1, &1, 1).unwrap();
-        assert_eq!(*segment1_level1.segment_number(), 1);
-        assert_eq!(segment1_level1.level_number(), 1);
-        assert_eq!(segment1_level1.highest_sequence_number(), 6);
-
-        let entries_1_2 = vec![
-            SsTableEntry {
-                key: String::from("key3"),
-                value: Some(String::from("value3")),
-                sequence_number: 7,
-            },
-            SsTableEntry {
-                key: String::from("key4"),
-                value: Some(String::from("value4")),
-                sequence_number: 8,
-            },
-        ];
-        let segment2_level1 = Segment::from_entries(&entries_1_2, &dir, &1, &2, 1).unwrap();
-        assert_eq!(*segment2_level1.segment_number(), 2);
-        assert_eq!(segment2_level1.level_number(), 1);
-        assert_eq!(segment2_level1.highest_sequence_number(), 8);
-
-        let entries_2_1 = vec![
-            SsTableEntry {
-                key: String::from("key1"),
-                value: Some(String::from("value1")),
-                sequence_number: 1,
-            },
-            SsTableEntry {
-                key: String::from("key2"),
-                value: Some(String::from("value2")),
-                sequence_number: 2,
-            },
-        ];
-        let segment1_level2 = Segment::from_entries(&entries_2_1, &dir, &2, &1, 1).unwrap();
-        assert_eq!(*segment1_level2.segment_number(), 1);
-        assert_eq!(segment1_level2.level_number(), 2);
-        assert_eq!(segment1_level2.highest_sequence_number(), 2);
-
-        let entries_2_2 = vec![
-            SsTableEntry {
-                key: String::from("key4"),
-                value: None,
-                sequence_number: 3,
-            },
-            SsTableEntry {
-                key: String::from("key5"),
-                value: Some(String::from("value5")),
-                sequence_number: 4,
-            },
-        ];
-        let segment2_level2 = Segment::from_entries(&entries_2_2, &dir, &2, &2, 10).unwrap();
-        assert_eq!(*segment2_level2.segment_number(), 2);
-        assert_eq!(segment2_level2.level_number(), 2);
-        assert_eq!(segment2_level2.highest_sequence_number(), 4);
-
-        let target_size = (segment1_level1.size() + segment2_level1.size() - 10) / 2;
+        let target_size = segment2_level1.size() + 50;
         let level1 = SsTableLevel::from(PartitionedLevel::from(
             vec![Arc::new(segment1_level1), Arc::new(segment2_level1)],
             target_size,
             Arc::new(10),
             1,
         ));
+        assert_eq!(level1.segments_to_merge().len(), 1);
 
         let level2 = SsTableLevel::from(PartitionedLevel::from(
             vec![Arc::new(segment1_level2), Arc::new(segment2_level2)],
@@ -1531,7 +1437,424 @@ mod tests {
         assert!(matches!(
             level1.check_merge_status(&level2),
             Ok(MergeStatus::Pending)
-        ))
+        ));
+
+        let container = LevelContainer::from_dir(&dir, target_size / 2, 2, 10.into()).unwrap();
+        assert_eq!(container.partitioned_levels.len(), 2);
+        assert_eq!(container.partitioned_levels[0].level_number(), 1);
+        assert_eq!(container.partitioned_levels[1].level_number(), 2);
+        assert_eq!(container.partitioned_levels[0].inner.segments.len(), 1);
+        assert_eq!(container.partitioned_levels[1].inner.segments.len(), 2);
+
+        let entries: VecDeque<SsTableEntry> = vec![
+            SsTableEntry {
+                key: String::from("key3"),
+                value: Some(String::from("value3")),
+                sequence_number: 7,
+            },
+            SsTableEntry {
+                key: String::from("key4"),
+                value: Some(String::from("value4")),
+                sequence_number: 8,
+            },
+        ]
+        .into();
+        let segment = container.partitioned_levels[0].inner.segments[0].clone();
+        let level_1_entries = segment.read_at_most(&0, &segment.size()).unwrap();
+        assert_eq!(level_1_entries, entries);
+
+        let entries: VecDeque<SsTableEntry> = vec![
+            SsTableEntry {
+                key: String::from("key1"),
+                value: Some(String::from("value1")),
+                sequence_number: 5,
+            },
+            SsTableEntry {
+                key: String::from("key2"),
+                value: Some(String::from("value2")),
+                sequence_number: 6,
+            },
+        ]
+        .into();
+        let segment = container.partitioned_levels[1].inner.segments[0].clone();
+        let level_2_segment_0_entries = segment.read_at_most(&0, &segment.size()).unwrap();
+        assert_eq!(entries, level_2_segment_0_entries);
+
+        let entries: VecDeque<SsTableEntry> = vec![
+            SsTableEntry {
+                key: String::from("key4"),
+                value: None,
+                sequence_number: 3,
+            },
+            SsTableEntry {
+                key: String::from("key5"),
+                value: Some(String::from("value5")),
+                sequence_number: 4,
+            },
+        ]
+        .into();
+        let segment = container.partitioned_levels[1].inner.segments[1].clone();
+        let level_2_segment_1_entries = segment.read_at_most(&0, &segment.size()).unwrap();
+        assert_eq!(entries, level_2_segment_1_entries);
+    }
+
+    #[test]
+    fn container_from_dir_two_higher_levels_merge_status_finish() {
+        /*
+        entry: {key, value, sequence_number}, segments ordered by number
+        level 1: {{key1, value1, 1}, {key2, value2, 2}}, {{key3, value3, 7}, {key4, value4, 8}}
+        level 2: {{key1, value1, 1}, {key2, value2, 2}, {key3, value3, 3}}, {{key4, None, 4}, {key5, value5, 5}}
+
+        Segment 1 of level 1 is to be merged -> finish
+
+        new level 1: {{key3, value3, 7}, {key4, value4, 8}}
+        new level 2: {{key1, value1, 1}, {key2, value2, 2}, {key3, value3, 3}}, {{key4, None, 4}, {key5, value5, 5}}
+        */
+        let dir = PathBuf::from("./container_from_dir_two_higher_levels_merge_status_finish");
+        let cl = Cleanup { dir: dir.clone() };
+        assert!(cl.setup().is_ok());
+
+        let entries_1_1 = vec![
+            SsTableEntry {
+                key: String::from("key1"),
+                value: Some(String::from("value1")),
+                sequence_number: 1,
+            },
+            SsTableEntry {
+                key: String::from("key2"),
+                value: Some(String::from("value2")),
+                sequence_number: 2,
+            },
+        ];
+        let segment1_level1 = Segment::from_entries(&entries_1_1, &dir, &1, &1, 1).unwrap();
+        assert_eq!(*segment1_level1.segment_number(), 1);
+        assert_eq!(segment1_level1.level_number(), 1);
+        assert_eq!(segment1_level1.highest_sequence_number(), 2);
+
+        let entries_1_2 = vec![
+            SsTableEntry {
+                key: String::from("key3"),
+                value: Some(String::from("value3")),
+                sequence_number: 7,
+            },
+            SsTableEntry {
+                key: String::from("key4"),
+                value: Some(String::from("value4")),
+                sequence_number: 8,
+            },
+        ];
+        let segment2_level1 = Segment::from_entries(&entries_1_2, &dir, &1, &2, 1).unwrap();
+        assert_eq!(*segment2_level1.segment_number(), 2);
+        assert_eq!(segment2_level1.level_number(), 1);
+        assert_eq!(segment2_level1.highest_sequence_number(), 8);
+
+        let entries_2_1 = vec![
+            SsTableEntry {
+                key: String::from("key1"),
+                value: Some(String::from("value1")),
+                sequence_number: 1,
+            },
+            SsTableEntry {
+                key: String::from("key2"),
+                value: Some(String::from("value2")),
+                sequence_number: 2,
+            },
+            SsTableEntry {
+                key: String::from("key3"),
+                value: Some(String::from("value3")),
+                sequence_number: 3,
+            },
+        ];
+        let segment1_level2 = Segment::from_entries(&entries_2_1, &dir, &2, &1, 1).unwrap();
+        assert_eq!(*segment1_level2.segment_number(), 1);
+        assert_eq!(segment1_level2.level_number(), 2);
+        assert_eq!(segment1_level2.highest_sequence_number(), 3);
+
+        let entries_2_2 = vec![
+            SsTableEntry {
+                key: String::from("key4"),
+                value: None,
+                sequence_number: 4,
+            },
+            SsTableEntry {
+                key: String::from("key5"),
+                value: Some(String::from("value5")),
+                sequence_number: 5,
+            },
+        ];
+        let segment2_level2 = Segment::from_entries(&entries_2_2, &dir, &2, &2, 10).unwrap();
+        assert_eq!(*segment2_level2.segment_number(), 2);
+        assert_eq!(segment2_level2.level_number(), 2);
+        assert_eq!(segment2_level2.highest_sequence_number(), 5);
+
+        let target_size = segment2_level1.size() + 10;
+        let level1 = SsTableLevel::from(PartitionedLevel::from(
+            vec![Arc::new(segment1_level1), Arc::new(segment2_level1)],
+            target_size,
+            Arc::new(10),
+            1,
+        ));
+        assert_eq!(level1.segments_to_merge().len(), 1);
+
+        let level2 = SsTableLevel::from(PartitionedLevel::from(
+            vec![Arc::new(segment1_level2), Arc::new(segment2_level2)],
+            target_size * 2,
+            10.into(),
+            2,
+        ));
+        let status = level1.check_merge_status(&level2).unwrap();
+        assert!(matches!(status, MergeStatus::Finish));
+
+        let container = LevelContainer::from_dir(&dir, target_size / 2, 2, 10.into()).unwrap();
+        assert_eq!(container.partitioned_levels.len(), 2);
+        assert_eq!(container.partitioned_levels[0].level_number(), 1);
+        assert_eq!(container.partitioned_levels[1].level_number(), 2);
+        assert_eq!(container.partitioned_levels[0].inner.segments.len(), 1);
+        assert_eq!(container.partitioned_levels[1].inner.segments.len(), 2);
+
+        let entries: VecDeque<SsTableEntry> = vec![
+            SsTableEntry {
+                key: String::from("key3"),
+                value: Some(String::from("value3")),
+                sequence_number: 7,
+            },
+            SsTableEntry {
+                key: String::from("key4"),
+                value: Some(String::from("value4")),
+                sequence_number: 8,
+            },
+        ]
+        .into();
+        let segment = container.partitioned_levels[0].inner.segments[0].clone();
+        let level_1_entries = segment.read_at_most(&0, &segment.size()).unwrap();
+        assert_eq!(level_1_entries, entries);
+
+        let entries: VecDeque<SsTableEntry> = vec![
+            SsTableEntry {
+                key: String::from("key1"),
+                value: Some(String::from("value1")),
+                sequence_number: 1,
+            },
+            SsTableEntry {
+                key: String::from("key2"),
+                value: Some(String::from("value2")),
+                sequence_number: 2,
+            },
+            SsTableEntry {
+                key: String::from("key3"),
+                value: Some(String::from("value3")),
+                sequence_number: 3,
+            },
+        ]
+        .into();
+        let segment = container.partitioned_levels[1].inner.segments[0].clone();
+        let level_2_segment_0_entries = segment.read_at_most(&0, &segment.size()).unwrap();
+        assert_eq!(entries, level_2_segment_0_entries);
+
+        let entries: VecDeque<SsTableEntry> = vec![
+            SsTableEntry {
+                key: String::from("key4"),
+                value: None,
+                sequence_number: 3,
+            },
+            SsTableEntry {
+                key: String::from("key5"),
+                value: Some(String::from("value5")),
+                sequence_number: 4,
+            },
+        ]
+        .into();
+        let segment = container.partitioned_levels[1].inner.segments[1].clone();
+        let level_2_segment_1_entries = segment.read_at_most(&0, &segment.size()).unwrap();
+        assert_eq!(entries, level_2_segment_1_entries);
+    }
+
+    #[test]
+    fn container_from_dir_two_higher_levels_merge_status_rollback() {
+        /*
+        entry: {key, value, sequence_number}, segments ordered by number
+        level 1: {{key1, value1, 1}, {key2, value2, 2}},
+                 {{key5, None, 6}, {key6, value6, 7}},
+                 {{key3, value3, 8}, {key4, value4, 9}},
+
+        level 2: {{key1, value1, 1}, {key2, value2, 2}},
+                 {{key3, None, 3}, {key5, value5, 5}}
+
+        Segment 1 and 2 of level 1 are to be merged -> rollback, since entries of segment 2 are not in level 2
+
+        new level 1: {{key3, value3, 8}, {key4, value4, 9}},
+        new level 2: {{key1, value1, 1}, {key2, value2, 2}, {key3, None, 3}, {key5, None, 6}, {key6, value6, 7}}
+        */
+        let dir = PathBuf::from("./container_from_dir_two_higher_levels_merge_status_rollback");
+        let cl = Cleanup { dir: dir.clone() };
+        assert!(cl.setup().is_ok());
+
+        let entries_1_1 = vec![
+            SsTableEntry {
+                key: String::from("key1"),
+                value: Some(String::from("value1")),
+                sequence_number: 1,
+            },
+            SsTableEntry {
+                key: String::from("key2"),
+                value: Some(String::from("value2")),
+                sequence_number: 2,
+            },
+        ];
+        let segment1_level1 = Segment::from_entries(&entries_1_1, &dir, &1, &1, 1).unwrap();
+        assert_eq!(*segment1_level1.segment_number(), 1);
+        assert_eq!(segment1_level1.level_number(), 1);
+        assert_eq!(segment1_level1.highest_sequence_number(), 2);
+
+        let entries_1_2 = vec![
+            SsTableEntry {
+                key: String::from("key5"),
+                value: None,
+                sequence_number: 6,
+            },
+            SsTableEntry {
+                key: String::from("key6"),
+                value: Some(String::from("value6")),
+                sequence_number: 7,
+            },
+        ];
+        let segment2_level1 = Segment::from_entries(&entries_1_2, &dir, &1, &2, 1).unwrap();
+        assert_eq!(*segment2_level1.segment_number(), 2);
+        assert_eq!(segment2_level1.level_number(), 1);
+        assert_eq!(segment2_level1.highest_sequence_number(), 7);
+
+        let entries_1_3 = vec![
+            SsTableEntry {
+                key: String::from("key3"),
+                value: Some(String::from("value3")),
+                sequence_number: 8,
+            },
+            SsTableEntry {
+                key: String::from("key4"),
+                value: Some(String::from("value4")),
+                sequence_number: 9,
+            },
+        ];
+        let segment3_level1 = Segment::from_entries(&entries_1_3, &dir, &1, &3, 1).unwrap();
+        assert_eq!(*segment3_level1.segment_number(), 3);
+        assert_eq!(segment3_level1.level_number(), 1);
+        assert_eq!(segment3_level1.highest_sequence_number(), 9);
+
+        let entries_2_1 = vec![
+            SsTableEntry {
+                key: String::from("key1"),
+                value: Some(String::from("value1")),
+                sequence_number: 1,
+            },
+            SsTableEntry {
+                key: String::from("key2"),
+                value: Some(String::from("value2")),
+                sequence_number: 2,
+            },
+        ];
+        let segment1_level2 = Segment::from_entries(&entries_2_1, &dir, &2, &1, 1).unwrap();
+        assert_eq!(*segment1_level2.segment_number(), 1);
+        assert_eq!(segment1_level2.level_number(), 2);
+        assert_eq!(segment1_level2.highest_sequence_number(), 2);
+
+        /*{{key3, None, 3}, {key5, value5, 5}} */
+        let entries_2_2 = vec![
+            SsTableEntry {
+                key: String::from("key3"),
+                value: None,
+                sequence_number: 3,
+            },
+            SsTableEntry {
+                key: String::from("key5"),
+                value: Some(String::from("value5")),
+                sequence_number: 5,
+            },
+        ];
+        let segment2_level2 = Segment::from_entries(&entries_2_2, &dir, &2, &2, 10).unwrap();
+        assert_eq!(*segment2_level2.segment_number(), 2);
+        assert_eq!(segment2_level2.level_number(), 2);
+        assert_eq!(segment2_level2.highest_sequence_number(), 5);
+
+        let target_size = segment3_level1.size() + 10;
+        let level1 = SsTableLevel::from(PartitionedLevel::from(
+            vec![
+                Arc::new(segment1_level1),
+                Arc::new(segment2_level1),
+                Arc::new(segment3_level1),
+            ],
+            target_size,
+            Arc::new(10),
+            1,
+        ));
+        assert_eq!(level1.segments_to_merge().len(), 2);
+
+        let level2 = SsTableLevel::from(PartitionedLevel::from(
+            vec![Arc::new(segment1_level2), Arc::new(segment2_level2)],
+            target_size * 2,
+            10.into(),
+            2,
+        ));
+        let status = level1.check_merge_status(&level2).unwrap();
+        assert!(matches!(status, MergeStatus::Rollback));
+
+        let container = LevelContainer::from_dir(&dir, target_size / 2, 2, 10.into()).unwrap();
+        assert_eq!(container.partitioned_levels.len(), 2);
+        assert_eq!(container.partitioned_levels[0].level_number(), 1);
+        assert_eq!(container.partitioned_levels[1].level_number(), 2);
+        assert_eq!(container.partitioned_levels[0].inner.segments.len(), 1);
+        assert_eq!(container.partitioned_levels[1].inner.segments.len(), 1);
+
+        let entries: VecDeque<SsTableEntry> = vec![
+            SsTableEntry {
+                key: String::from("key3"),
+                value: Some(String::from("value3")),
+                sequence_number: 8,
+            },
+            SsTableEntry {
+                key: String::from("key4"),
+                value: Some(String::from("value4")),
+                sequence_number: 9,
+            },
+        ]
+        .into();
+        let segment = container.partitioned_levels[0].inner.segments[0].clone();
+        let level_1_entries = segment.read_at_most(&0, &segment.size()).unwrap();
+        assert_eq!(level_1_entries, entries);
+
+        /*
+        {{key1, value1, 1}, {key2, value2, 2}, {key3, None, 3}, {key5, None, 6}, {key6, value6, 7}}
+        */
+        let entries: VecDeque<SsTableEntry> = vec![
+            SsTableEntry {
+                key: String::from("key1"),
+                value: Some(String::from("value1")),
+                sequence_number: 1,
+            },
+            SsTableEntry {
+                key: String::from("key2"),
+                value: Some(String::from("value2")),
+                sequence_number: 2,
+            },
+            SsTableEntry {
+                key: String::from("key3"),
+                value: None,
+                sequence_number: 3,
+            },
+            SsTableEntry {
+                key: String::from("key5"),
+                value: None,
+                sequence_number: 6,
+            },
+            SsTableEntry {
+                key: String::from("key6"),
+                value: Some(String::from("value6")),
+                sequence_number: 7,
+            },
+        ]
+        .into();
+        let segment = container.partitioned_levels[1].inner.segments[0].clone();
+        let level_2_entries = segment.read_at_most(&0, &segment.size()).unwrap();
+        assert_eq!(level_2_entries, entries);
     }
 }
 
@@ -1541,6 +1864,9 @@ Testing
     1. Merge function
         1. The segments are OK
         2. The resulting level is indeed non-overlapping
+        3. When merging multiple levels (e.g. 1 into 2, 2 then exceeds target size and then 2 into 3)
+           make sure that no level exceeds target size (i.e. in the example above the segments that are
+           merged from level 2 into level 3 are no longer in the new level 2)
     2. Reading when multiple levels are involved -> make sure newest version is read if the key is in multiple levels
     3. Add impl for SsTable (or segment) so that we can input a vector of sstable entries
        (and some other data like level, segment number etc) to create an sstable segment

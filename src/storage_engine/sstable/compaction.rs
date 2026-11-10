@@ -45,11 +45,11 @@ impl CompactionBt {
         }
 
         let mut new_partitioned_levels = Vec::new();
-        let mut new_partitioned_level: Arc<SsTableLevel<PartitionedLevel>>;
         let mut segments_to_merge = level_zero.segments_to_merge();
         let mut segments_to_delete: Vec<Arc<Segment>>;
         let mut level_number = 1;
         loop {
+            let mut new_partitioned_level: SsTableLevel<PartitionedLevel>;
             match partitioned_levels.first() {
                 Some(level) => {
                     previous_target_size = level.target_size();
@@ -57,7 +57,6 @@ impl CompactionBt {
                     (new_partitioned_level, segments_to_delete) =
                         level.merge(&segments_to_merge)?;
                     self.segments_to_delete.append(&mut segments_to_delete);
-                    new_partitioned_levels.push(new_partitioned_level.clone());
                     let _ = partitioned_levels.remove(0);
                 }
                 None => {
@@ -70,14 +69,17 @@ impl CompactionBt {
                     (new_partitioned_level, segments_to_delete) =
                         level.merge(&segments_to_merge)?;
                     self.segments_to_delete.append(&mut segments_to_delete);
-                    new_partitioned_levels.push(new_partitioned_level.clone());
                 }
             }
             level_number += 1;
-            if !new_partitioned_level.exceeds_target_size() {
+            if new_partitioned_level.exceeds_target_size() {
+                segments_to_merge = new_partitioned_level.segments_to_merge();
+                new_partitioned_level.shrink_to_target_size();
+                new_partitioned_levels.push(Arc::new(new_partitioned_level));
+            } else {
+                new_partitioned_levels.push(Arc::new(new_partitioned_level));
                 break;
             }
-            segments_to_merge = new_partitioned_level.segments_to_merge();
         }
         new_partitioned_levels.append(&mut partitioned_levels);
         Ok(new_partitioned_levels)
@@ -98,10 +100,10 @@ impl CompactionBt {
         let mut previous_target_size = levels.first().unwrap().target_size();
         let mut curr_level_no = levels.first().unwrap().level_number() + 1;
         let mut new_partitioned_levels = Vec::new();
-        let mut new_partitioned_level: Arc<SsTableLevel<PartitionedLevel>>;
         let mut segments_to_delete: Vec<Arc<Segment>>;
         let _ = levels.remove(0);
         loop {
+            let mut new_partitioned_level: SsTableLevel<PartitionedLevel>;
             match levels.first() {
                 Some(level) => {
                     previous_target_size = level.target_size();
@@ -109,7 +111,6 @@ impl CompactionBt {
                     (new_partitioned_level, segments_to_delete) =
                         level.merge(&segments_to_merge)?;
                     self.segments_to_delete.append(&mut segments_to_delete);
-                    new_partitioned_levels.push(new_partitioned_level.clone());
                     let _ = levels.remove(0); // TODO: maybe VecDeque is better for this purpose
                 }
                 None => {
@@ -122,14 +123,17 @@ impl CompactionBt {
                     (new_partitioned_level, segments_to_delete) =
                         level.merge(&segments_to_merge)?;
                     self.segments_to_delete.append(&mut segments_to_delete);
-                    new_partitioned_levels.push(new_partitioned_level.clone());
                 }
             }
             curr_level_no += 1;
-            if !new_partitioned_level.exceeds_target_size() {
+            if new_partitioned_level.exceeds_target_size() {
+                segments_to_merge = new_partitioned_level.segments_to_merge();
+                new_partitioned_level.shrink_to_target_size();
+                new_partitioned_levels.push(Arc::new(new_partitioned_level));
+            } else {
+                new_partitioned_levels.push(Arc::new(new_partitioned_level));
                 break;
             }
-            segments_to_merge = new_partitioned_level.segments_to_merge();
         }
         new_partitioned_levels.append(&mut levels);
         Ok(new_partitioned_levels)
