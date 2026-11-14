@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // length 4 bytes checksum 4 bytes key_len 4 bytes and op 1 bytes
 pub static HEADER_SIZE: usize = 3 * size_of::<u32>() + size_of::<u8>();
@@ -90,12 +90,12 @@ pub fn determine_segment_filename(
     timeline_hex_str + &sequence_number_hex_str[0..8] + &segment_size_hex_str[8..] + ".wal"
 }
 
-pub fn final_entry_after(filename: &str, file_size: u64, sequence_number: &u64) -> bool {
+pub fn final_entry_after(filename: &str, file_size: u64, sequence_number: u64) -> bool {
     let segment_no = u64::from_str_radix(&filename[16..24], 16).unwrap();
     let logical_log_no = u64::from_str_radix(&filename[8..16], 16).unwrap();
     // segment goes from logical_log_no * 2^32 + file_size * segment_no
     // until logical_log_no * 2^32 + file_size * (segment_no + 1) - 1
-    *sequence_number < logical_log_no * 2u64.pow(32) + file_size * (segment_no + 1)
+    sequence_number < logical_log_no * 2u64.pow(32) + file_size * (segment_no + 1)
 }
 
 impl Segment {
@@ -107,8 +107,7 @@ impl Segment {
 
     pub fn pad(&mut self) -> std::io::Result<()> {
         let buf_size = self.max_size - self.file_size;
-        let mut buf = Vec::new();
-        buf.resize(buf_size as usize, 0);
+        let buf = vec![0; buf_size as usize];
         self.append(buf.as_slice())
     }
 
@@ -121,11 +120,11 @@ impl Segment {
             + u64::from_str_radix(&filename[16..], 16).unwrap() * max_size as u64;
 
         Segment {
-            file: file,
+            file,
             file_path: path,
-            file_size: file_size,
-            max_size: max_size,
-            base_lsn: base_lsn,
+            file_size,
+            max_size,
+            base_lsn,
         }
     }
 
@@ -136,11 +135,11 @@ impl Segment {
         let base_lsn = u64::from_str_radix(&filename[8..16], 16).unwrap() * 2u64.pow(32)
             + u64::from_str_radix(&filename[16..], 16).unwrap() * max_size as u64;
         Segment {
-            file: file,
+            file,
             file_path: path,
-            file_size: file_size,
-            max_size: max_size,
-            base_lsn: base_lsn,
+            file_size,
+            max_size,
+            base_lsn,
         }
     }
 
@@ -190,12 +189,11 @@ impl Segment {
             Err(e) => match e {
                 RecoveryError::Io(_) => Err(e),
                 RecoveryError::Corrupted(fp, buf_offset) => {
-                    let offset: u64;
-                    if buf_offset > part_rec_size {
-                        offset = buf_offset - part_rec_size;
+                    let offset = if buf_offset > part_rec_size {
+                        buf_offset - part_rec_size
                     } else {
-                        offset = buf_offset;
-                    }
+                        buf_offset
+                    };
                     Err(RecoveryError::Corrupted(fp, offset))
                 }
             },
@@ -203,8 +201,8 @@ impl Segment {
     }
 
     fn parse_validate_wal_entries(
-        file_path: &PathBuf,
-        bytes: &Vec<u8>,
+        file_path: &Path,
+        bytes: &[u8],
         entries: &mut Vec<WalEntry>,
     ) -> Result<Option<PartialWalEntry>, RecoveryError> {
         let mut offset: usize = 0;
@@ -220,7 +218,10 @@ impl Segment {
             u32_buf.copy_from_slice(&bytes[offset..offset + size_of::<u32>()]);
             record_len = u32::from_le_bytes(u32_buf) as usize;
             if record_len < HEADER_SIZE - size_of::<u32>() {
-                return Err(RecoveryError::Corrupted(file_path.clone(), record_offset));
+                return Err(RecoveryError::Corrupted(
+                    file_path.to_path_buf(),
+                    record_offset,
+                ));
             }
             if offset + size_of::<u32>() + record_len > bytes.len() {
                 break;
@@ -233,11 +234,16 @@ impl Segment {
             let calculated_checksum =
                 calculate_checksum(&bytes[offset..offset + record_len - size_of::<u32>()]);
             if read_checksum != calculated_checksum {
-                return Err(RecoveryError::Corrupted(file_path.clone(), record_offset));
+                return Err(RecoveryError::Corrupted(
+                    file_path.to_path_buf(),
+                    record_offset,
+                ));
             }
             let entry =
                 WalEntry::from_bytes(&bytes[offset..offset + record_len - size_of::<u32>()])
-                    .map_err(|_| RecoveryError::Corrupted(file_path.clone(), record_offset))?;
+                    .map_err(|_| {
+                        RecoveryError::Corrupted(file_path.to_path_buf(), record_offset)
+                    })?;
             entries.push(entry);
             offset += record_len - size_of::<u32>();
         }
@@ -247,7 +253,7 @@ impl Segment {
             let partial_entry = PartialWalEntry {
                 bytes: bytes[offset..offset + HEADER_SIZE].to_vec(),
                 offset: record_offset,
-                segment_file_path: file_path.clone(),
+                segment_file_path: file_path.to_path_buf(),
             };
             Ok(Some(partial_entry))
         }
@@ -277,8 +283,7 @@ impl WalEntry {
                 HEADER_SIZE + size_of::<u32>() + size_of::<u64>() + self.key.len() + value.len()
             }
         };
-        let mut buf: Vec<u8> = Vec::new();
-        buf.resize(buf_size, 0);
+        let mut buf: Vec<u8> = vec![0; buf_size];
         let mut offset = 2 * size_of::<u32>();
         match self.operation_type {
             OpType::Put => {
@@ -295,7 +300,7 @@ impl WalEntry {
         buf[offset..offset + size_of::<u32>()].copy_from_slice(&key_len.to_le_bytes());
         offset += size_of::<u32>();
         buf[offset..offset + self.key.len()].copy_from_slice(self.key.as_bytes());
-        offset = offset + self.key.len();
+        offset += self.key.len();
         if let Some(value) = &self.value {
             let value_len = value.len() as u32;
             buf[offset..offset + size_of::<u32>()].copy_from_slice(&value_len.to_le_bytes());
@@ -317,12 +322,11 @@ impl WalEntry {
         }
         let mut u32_buf: [u8; 4] = [0, 0, 0, 0];
         let mut offset: usize = 1;
-        let op: OpType;
-        if bytes[0] == 1 {
-            op = OpType::Put;
+        let op = if bytes[0] == 1 {
+            OpType::Put
         } else {
-            op = OpType::Delete;
-        }
+            OpType::Delete
+        };
         u32_buf.copy_from_slice(&bytes[offset..offset + size_of::<u32>()]);
         let key_len = u32::from_le_bytes(u32_buf);
         offset += size_of::<u32>();
@@ -354,9 +358,9 @@ impl WalEntry {
         let sequence_number = u64::from_le_bytes(u64_buf);
         Ok(WalEntry {
             operation_type: op,
-            key: key,
-            value: value,
-            sequence_number: sequence_number,
+            key,
+            value,
+            sequence_number,
         })
     }
 }
@@ -1411,7 +1415,7 @@ mod tests {
         ];
         for test in tests {
             assert_eq!(
-                final_entry_after(&test.filename, test.file_size, &test.sequence_number),
+                final_entry_after(&test.filename, test.file_size, test.sequence_number),
                 test.expected
             );
         }

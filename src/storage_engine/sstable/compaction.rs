@@ -23,11 +23,11 @@ impl CompactionBt {
         level_size_factor: u64,
     ) -> Self {
         CompactionBt {
-            container: container,
+            container,
             segments_to_delete: Vec::new(),
-            cv: cv,
-            stop: stop,
-            level_size_factor: level_size_factor,
+            cv,
+            stop,
+            level_size_factor,
         }
     }
     /// Compaction starting at level 0, that is the first merge is from level 0 into level 1.
@@ -162,12 +162,12 @@ impl CompactionBt {
             idx += 1;
         }
         if idx == partitioned_levels.len() {
-            return (partitioned_levels, Vec::new());
+            (partitioned_levels, Vec::new())
         } else {
-            return (
+            (
                 partitioned_levels[0..idx].to_vec(),
                 partitioned_levels[idx..].to_vec(),
-            );
+            )
         }
     }
 

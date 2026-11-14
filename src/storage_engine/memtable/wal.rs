@@ -15,21 +15,21 @@ impl Wal {
         let filename = PathBuf::from(determine_segment_filename(&0, &0, &segment_max_size));
         let path = dir.join(filename);
         let file = std::fs::File::create(&path)?;
-        let segment = Segment::new(file, path, segment_max_size);
+        let active_segment = Segment::new(file, path, segment_max_size);
 
         let wal = Wal {
-            active_segment: segment,
-            segment_max_size: segment_max_size,
-            dir: dir,
+            active_segment,
+            segment_max_size,
+            dir,
         };
         Ok(wal)
     }
 
-    pub fn from_segment(dir: PathBuf, segment: Segment, segment_size: u32) -> Self {
+    pub fn from_segment(dir: PathBuf, segment: Segment, segment_max_size: u32) -> Self {
         Wal {
             active_segment: segment,
-            segment_max_size: segment_size,
-            dir: dir,
+            segment_max_size,
+            dir,
         }
     }
 

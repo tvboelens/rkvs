@@ -58,7 +58,7 @@ impl SsTable {
         })
     }
 
-    pub fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>> {
+    pub fn get(&self, key: &str) -> io::Result<Option<SsTableEntry>> {
         let level_zero: Arc<SsTableLevel<OverlappingLevel>>;
         let partitioned_levels: Vec<Arc<SsTableLevel<PartitionedLevel>>>;
         {
@@ -136,7 +136,7 @@ impl SsTableEntry {
         let key_len = self.key.len() as u32;
         buf[offset..offset + size_of::<u32>()].copy_from_slice(&key_len.to_le_bytes());
         offset += size_of::<u32>();
-        buf[offset..offset + self.key.len()].copy_from_slice(&self.key.as_bytes());
+        buf[offset..offset + self.key.len()].copy_from_slice(self.key.as_bytes());
         offset += self.key.len();
         match &self.value {
             Some(value) => {
@@ -145,7 +145,7 @@ impl SsTableEntry {
                 offset += size_of::<u32>();
                 buf[offset] = 0;
                 offset += 1;
-                buf[offset..offset + value.len()].copy_from_slice(&value.as_bytes());
+                buf[offset..offset + value.len()].copy_from_slice(value.as_bytes());
                 offset += value.len();
             }
             None => {
@@ -173,22 +173,19 @@ impl SsTableEntry {
         offset += size_of::<u32>();
         let tombstone_value = bytes[offset];
         offset += 1;
-        let value: Option<String>;
-        if tombstone_value == 1 {
-            value = None;
+        let value: Option<String> = if tombstone_value == 1 {
+            None
         } else {
-            value = Some(
-                String::from_utf8(bytes[offset..offset + value_len as usize].to_vec()).unwrap(),
-            );
-        }
+            Some(String::from_utf8(bytes[offset..offset + value_len as usize].to_vec()).unwrap())
+        };
         offset += value_len as usize;
         let mut u64_buf: [u8; size_of::<u64>()] = [0, 0, 0, 0, 0, 0, 0, 0];
         u64_buf.copy_from_slice(&bytes[offset..offset + size_of::<u64>()]);
-        let sequence_no = u64::from_le_bytes(u64_buf);
+        let sequence_number = u64::from_le_bytes(u64_buf);
         SsTableEntry {
-            key: key,
-            value: value,
-            sequence_number: sequence_no,
+            key,
+            value,
+            sequence_number,
         }
     }
 
@@ -209,7 +206,7 @@ impl SsTableEntry {
 
     pub fn from(key: String, value: MemTableValue) -> Self {
         SsTableEntry {
-            key: key,
+            key,
             value: value.value,
             sequence_number: value.sequence_number,
         }
@@ -225,7 +222,7 @@ impl SsTableEntry {
             let record_len = u32::from_le_bytes(u32_buf);
             offset += size_of::<u32>();
             res.push(SsTableEntry::from_bytes(
-                &buf[offset..offset + record_len as usize].to_vec(),
+                &buf[offset..offset + record_len as usize],
             ));
             offset += record_len as usize;
         }

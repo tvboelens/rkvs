@@ -15,7 +15,7 @@ pub trait SstLevel {
     /// Searches all the segments in the level for the entry.
     /// If multiple entries are found with the key, returns the
     /// newest entry, i.e. the one with the highest sequence number.
-    fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>>;
+    fn get(&self, key: &str) -> io::Result<Option<SsTableEntry>>;
     /// If the level exceeds target size, this method returns all
     /// segments that should be merged into the next level.
     /// In the current version we choose segments from old to new
@@ -146,7 +146,7 @@ impl LevelContainer {
         // on which we will perform recovery
         // TODO: We should probably check for gaps in the level numbers,
         // i.e. I think the level numbers should be 0, 1, ..., n
-        segments.sort_by(|s1, s2| s1.level_number().cmp(&s2.level_number()));
+        segments.sort_by_key(|s| s.level_number());
         let mut level_zero_segments = Vec::new();
         let mut higher_level_segments = Vec::new();
         let mut higher_levels = Vec::new();
@@ -223,8 +223,8 @@ impl LevelContainer {
         }
         // Execute merges if needed
         let mut segments_to_merge = level_zero.segments_to_merge();
-        let mut it = higher_levels.into_iter();
-        while let Some(mut level) = it.next() {
+        let it = higher_levels.into_iter();
+        for mut level in it {
             if !segments_to_merge.is_empty() {
                 let (new_level, segments_to_delete) = level.merge(&segments_to_merge)?;
                 for segment in segments_to_delete {
@@ -322,7 +322,7 @@ impl LevelContainer {
 }
 
 impl SstLevel for OverlappingLevel {
-    fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>> {
+    fn get(&self, key: &str) -> io::Result<Option<SsTableEntry>> {
         let mut curr_entry = None;
         for segment in &self.segments {
             curr_entry = match segment.get(key)? {
@@ -390,7 +390,7 @@ impl SstLevel for OverlappingLevel {
 }
 
 impl SstLevel for PartitionedLevel {
-    fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>> {
+    fn get(&self, key: &str) -> io::Result<Option<SsTableEntry>> {
         self.find_containing_segment(key)
             .map(|segment| segment.get(key))
             .transpose()
@@ -442,9 +442,7 @@ impl SstLevel for PartitionedLevel {
             } else {
                 match self.segments.pop() {
                     None => (),
-                    Some(segment) => {
-                        let _ = std::fs::remove_file(segment.filepath())?;
-                    }
+                    Some(segment) => std::fs::remove_file(segment.filepath())?,
                 }
             }
         }
@@ -468,15 +466,16 @@ impl SstLevel for PartitionedLevel {
         let mut segment_numbers_rollback = BTreeSet::new();
         let mut found = false;
         let mut not_found = false;
-        let mut it = self.segments_to_merge().into_iter();
-        while let Some(segment) = it.next() {
+        let it = self.segments_to_merge().into_iter();
+        for segment in it {
             let entries = segment.read_at_most(&0, &segment.size())?;
             for entry in &entries {
                 let mut containing_segment_exists = false;
                 for nl_segment in &next_level.inner.segments {
                     // If the key range of the segment does not include the entry key,
                     // then we don't need to bother accessing the segment.
-                    if *nl_segment.first_key() <= entry.key && entry.key <= *nl_segment.last_key() {
+                    if *nl_segment.first_key() <= *entry.key && *entry.key <= *nl_segment.last_key()
+                    {
                         match nl_segment.get(&entry.key)? {
                             Some(nl_entry) => {
                                 if *entry == nl_entry {
@@ -519,14 +518,14 @@ impl PartitionedLevel {
         level_number: u64,
     ) -> Self {
         PartitionedLevel {
-            segments: segments,
-            target_size: target_size,
-            index_sparsity_factor: index_sparsity_factor,
-            level_number: level_number,
+            segments,
+            target_size,
+            index_sparsity_factor,
+            level_number,
         }
     }
 
-    fn find_containing_segment(&self, key: &String) -> Option<Arc<Segment>> {
+    fn find_containing_segment(&self, key: &str) -> Option<Arc<Segment>> {
         if self.segments.is_empty() {
             None
         } else {
@@ -609,23 +608,18 @@ impl PartitionedLevel {
             &dir,
             &self.level_number,
             &new_segment_number,
-            self.index_sparsity_factor.deref().clone(),
+            *self.index_sparsity_factor.deref(),
         )?;
         new_segment_number += 1;
         for buf in &mut read_bufs {
             buf.fill()?
         }
-        read_bufs = read_bufs
-            .into_iter()
-            .filter(|buf| !buf.is_empty())
-            .collect();
+        read_bufs.retain(|buf| !buf.is_empty());
 
         while !read_bufs.is_empty() {
             let mut read_buf_refs = HashMap::new();
-            let mut idx: usize = 0;
-            for buf in &mut read_bufs {
-                read_buf_refs.insert(idx.clone(), buf);
-                idx += 1;
+            for (idx, buf) in read_bufs.iter_mut().enumerate() {
+                read_buf_refs.insert(idx, buf);
             }
             let mut write_buf = merge_sort(&mut read_buf_refs);
             while let Some(entry) = write_buf.pop_front() {
@@ -638,7 +632,7 @@ impl PartitionedLevel {
                         &dir,
                         &self.level_number,
                         &new_segment_number,
-                        self.index_sparsity_factor.deref().clone(),
+                        *self.index_sparsity_factor.deref(),
                     )?;
                     new_segment_number += 1;
                 }
@@ -650,10 +644,7 @@ impl PartitionedLevel {
 
             // If a read buffer is still empty after filling,
             // it has reached the end of the segment, so it can be discarded
-            read_bufs = read_bufs
-                .into_iter()
-                .filter(|buf| !buf.is_empty())
-                .collect();
+            read_bufs.retain(|buf| !buf.is_empty());
         }
         // We might have exited the loop without writing the index and footer
         // of the last segment. In that case do it here
@@ -784,7 +775,7 @@ fn merge_sort(
             // the same key. We need to find the entry with the highest sequence number
             let mut it = curr_bufs.iter_mut();
             let mut curr_entry = it.next().unwrap().pop_front().unwrap();
-            while let Some(buf) = it.next() {
+            for buf in it {
                 let entry = buf.pop_front().unwrap();
                 if entry.sequence_number > curr_entry.sequence_number {
                     curr_entry = entry;
@@ -793,7 +784,7 @@ fn merge_sort(
             res.push_back(curr_entry);
             curr_bufs.retain(|buf| {
                 buf.front()
-                    .map_or(false, |entry| entry.key <= smallest_final_key)
+                    .is_some_and(|entry| entry.key <= smallest_final_key)
             });
             // keep adding from from the current buffers until all keys of first entries in
             // the current buffers are larger than next_key (or larger than smallest_final_key
@@ -801,21 +792,18 @@ fn merge_sort(
             loop {
                 let mut pot_next_entry: Option<&SsTableEntry> = None;
                 for buf in curr_bufs.iter() {
-                    match buf.front() {
-                        Some(entry) => {
-                            let replace = match pot_next_entry {
-                                Some(nentry) => {
-                                    entry.key < nentry.key
-                                        || (entry.key == nentry.key
-                                            && entry.sequence_number > nentry.sequence_number)
-                                }
-                                None => entry.key <= smallest_final_key,
-                            };
-                            if replace {
-                                pot_next_entry = Some(entry);
+                    if let Some(entry) = buf.front() {
+                        let replace = match pot_next_entry {
+                            Some(nentry) => {
+                                entry.key < nentry.key
+                                    || (entry.key == nentry.key
+                                        && entry.sequence_number > nentry.sequence_number)
                             }
+                            None => entry.key <= smallest_final_key,
+                        };
+                        if replace {
+                            pot_next_entry = Some(entry);
                         }
-                        None => (),
                     }
                 }
                 let next_entry = pot_next_entry.cloned();
@@ -830,13 +818,10 @@ fn merge_sort(
                         };
                         if insert {
                             for buf in &mut curr_bufs {
-                                match buf.front() {
-                                    None => (),
-                                    Some(e) => {
-                                        if entry.key == e.key {
-                                            let _ = buf.pop_front();
-                                        }
-                                    }
+                                if let Some(e) = buf.front()
+                                    && entry.key == e.key
+                                {
+                                    let _ = buf.pop_front();
                                 }
                             }
                             res.push_back(entry);
@@ -847,50 +832,44 @@ fn merge_sort(
                 }
                 curr_bufs.retain(|buf| {
                     buf.front()
-                        .map_or(false, |entry| entry.key <= smallest_final_key)
+                        .is_some_and(|entry| entry.key <= smallest_final_key)
                 });
             }
         }
         for (idx, buf) in curr_bufs.into_iter().enumerate() {
-            match buf.front() {
-                Some(entry) => {
-                    // the current buf might need to be included in the next iteration
-                    let _ = next_key.as_ref().map_or((), |key| {
-                        if entry.key == *key {
-                            next_indices.push(curr_indices[idx]);
-                        }
-                    });
-                    // we can always reinsert if non-empty, since we have already filtered out
-                    // buffers whose next entry has key larger than smallest_final_key
-                    let _ = read_bufs.insert(curr_indices[idx], buf);
-                }
-                None => (),
+            if let Some(entry) = buf.front() {
+                // the current buf might need to be included in the next iteration
+                let _ = next_key.as_ref().map(|key| {
+                    if entry.key == *key {
+                        next_indices.push(curr_indices[idx]);
+                    }
+                });
+                // we can always reinsert if non-empty, since we have already filtered out
+                // buffers whose next entry has key larger than smallest_final_key
+                let _ = read_bufs.insert(curr_indices[idx], buf);
             }
         }
         std::mem::swap(&mut curr_indices, &mut next_indices);
         next_indices.clear();
-        match curr_indices.first() {
-            None => (), // done
-            Some(curr_idx) => {
-                let curr_key = &read_bufs.get(curr_idx).unwrap().front().unwrap().key;
-                let mut next_key: Option<&String> = None;
-                for (idx, buf) in read_bufs.iter() {
-                    let buf_key = &buf.front().unwrap().key;
-                    let push = match next_key {
-                        None => *buf_key > *curr_key && *buf_key <= smallest_final_key,
-                        Some(key) => *buf_key > *curr_key && *buf_key == *key,
-                    };
-                    let replace = match next_key {
-                        None => *buf_key > *curr_key && *buf_key <= smallest_final_key,
-                        Some(key) => *buf_key > *curr_key && *buf_key < *key,
-                    };
-                    if replace {
-                        next_key = Some(&buf.front().unwrap().key);
-                        next_indices = vec![*idx];
-                    }
-                    if push {
-                        next_indices.push(*idx);
-                    }
+        if let Some(curr_idx) = curr_indices.first() {
+            let curr_key = &read_bufs.get(curr_idx).unwrap().front().unwrap().key;
+            let mut next_key: Option<&String> = None;
+            for (idx, buf) in read_bufs.iter() {
+                let buf_key = &buf.front().unwrap().key;
+                let push = match next_key {
+                    None => *buf_key > *curr_key && *buf_key <= smallest_final_key,
+                    Some(key) => *buf_key > *curr_key && *buf_key == *key,
+                };
+                let replace = match next_key {
+                    None => *buf_key > *curr_key && *buf_key <= smallest_final_key,
+                    Some(key) => *buf_key > *curr_key && *buf_key < *key,
+                };
+                if replace {
+                    next_key = Some(&buf.front().unwrap().key);
+                    next_indices = vec![*idx];
+                }
+                if push {
+                    next_indices.push(*idx);
                 }
             }
         }
@@ -902,7 +881,7 @@ impl<T> SsTableLevel<T>
 where
     T: SstLevel,
 {
-    pub fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>> {
+    pub fn get(&self, key: &str) -> io::Result<Option<SsTableEntry>> {
         self.inner.get(key)
     }
 
@@ -943,9 +922,9 @@ impl SsTableLevel<PartitionedLevel> {
         SsTableLevel {
             inner: PartitionedLevel {
                 segments: Vec::new(),
-                target_size: target_size,
+                target_size,
                 index_sparsity_factor: Arc::new(1), // TODO
-                level_number: level_number,
+                level_number,
             },
         }
     }
@@ -989,8 +968,8 @@ impl SsTableLevel<PartitionedLevel> {
                 segments_to_delete.push(segment.clone());
                 continue;
             }
-            let mut it_older = it.clone();
-            while let Some(older_segment) = it_older.next() {
+            let it_older = it.clone();
+            for older_segment in it_older {
                 if segment.overlaps(older_segment) {
                     segments_to_delete.push(segment.clone());
                     break;
@@ -1022,7 +1001,7 @@ impl SsTableLevel<PartitionedLevel> {
     }
 
     /// Removes the oldest segments until target size is not exceeded
-    pub fn shrink_to_target_size(&mut self) -> () {
+    pub fn shrink_to_target_size(&mut self) {
         // sort so that we can pop from the back
         self.inner
             .segments
@@ -1046,12 +1025,12 @@ impl SsTableLevel<OverlappingLevel> {
         SsTableLevel {
             inner: OverlappingLevel {
                 segments: Vec::new(),
-                target_size: target_size,
+                target_size,
             },
         }
     }
 
-    fn add_segment(&mut self, segment: Segment) -> () {
+    fn add_segment(&mut self, segment: Segment) {
         self.inner.segments.push(Arc::new(segment));
     }
 
@@ -1068,8 +1047,9 @@ impl SsTableLevel<OverlappingLevel> {
 
 impl Clone for SsTableLevel<OverlappingLevel> {
     fn clone(&self) -> Self {
-        let inner = self.inner.clone();
-        SsTableLevel { inner: inner }
+        SsTableLevel {
+            inner: self.inner.clone(),
+        }
     }
 }
 

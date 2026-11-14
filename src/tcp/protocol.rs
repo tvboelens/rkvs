@@ -70,7 +70,7 @@ pub struct TcpResponse {
 }
 
 fn verify_magic_bytes(buf: &[u8; 4]) -> bool {
-    return *buf == MAGIC_BYTES;
+    *buf == MAGIC_BYTES
 }
 
 fn parse_request_type(n: u8) -> Result<RequestType, ()> {
@@ -82,7 +82,7 @@ fn parse_request_type(n: u8) -> Result<RequestType, ()> {
     }
 }
 
-fn parse_headers(buf: &Vec<u8>) -> Result<TcpHeaders, TcpError> {
+fn parse_headers(buf: &[u8]) -> Result<TcpHeaders, TcpError> {
     if !verify_magic_bytes(&buf[0..4].try_into().unwrap()) {
         return Err(TcpError::from(ConnectionError::WrongMagicBytes));
     }
@@ -99,15 +99,15 @@ fn parse_headers(buf: &Vec<u8>) -> Result<TcpHeaders, TcpError> {
 
     // TODO: optional headers
     Ok(TcpHeaders {
-        request_type: request_type,
-        correlation_id: correlation_id,
+        request_type,
+        correlation_id,
         protocol_version: version,
-        flags: flags,
+        flags,
     })
 }
 
 fn parse_payload(
-    buf: &Vec<u8>,
+    buf: &[u8],
     request_type: &RequestType,
     correlation_id: &Uuid,
 ) -> Result<Payload, TcpError> {
@@ -127,7 +127,7 @@ fn parse_payload(
                 let value = String::from_utf8(buf[key_len + 8..key_len + 8 + value_len].to_vec())
                     .map_err(|_| ParseError::InvalidValue(*correlation_id))?;
                 Ok(Payload {
-                    key: key,
+                    key,
                     value: Some(value),
                 })
             }
@@ -138,10 +138,7 @@ fn parse_payload(
                     *correlation_id,
                 )))
             } else {
-                Ok(Payload {
-                    key: key,
-                    value: None,
-                })
+                Ok(Payload { key, value: None })
             }
         }
     }
@@ -204,13 +201,12 @@ impl From<io::Error> for TcpError {
 
 impl TcpRequest {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.resize(8, 0);
-        let header_len: u32 = <usize as TryInto<u32>>::try_into(self.headers.len()).unwrap() + 4; // account for magic bytes
+        let mut bytes = vec![0; 8];
+        let header_len: u32 = <usize as TryInto<u32>>::try_into(self.headers.size()).unwrap() + 4; // account for magic bytes
         bytes[0..4].copy_from_slice(&header_len.to_be_bytes());
         bytes[4..8].copy_from_slice(&MAGIC_BYTES);
         bytes.append(&mut self.headers.to_bytes().to_vec());
-        let payload_len = self.payload.len() as u32;
+        let payload_len = self.payload.size() as u32;
         bytes.append(&mut payload_len.to_be_bytes().to_vec());
         bytes.append(&mut self.payload.to_bytes().to_vec());
         bytes
@@ -227,11 +223,9 @@ impl TcpResponse {
     }
 
     pub fn from_tcp_parse_error(error: ParseError) -> Self {
-        let correlation_id = error.extract_correlation_id();
-        let e = TcpError::from(error);
         TcpResponse {
-            correlation_id: correlation_id,
-            response_code: e.to_rc(),
+            correlation_id: error.extract_correlation_id(),
+            response_code: TcpError::from(error).to_rc(),
             payload: None,
         }
     }
@@ -253,7 +247,7 @@ impl TcpResponse {
         }
     }
 
-    pub fn len(&self) -> usize {
+    pub fn size(&self) -> usize {
         match &self.payload {
             Some(str) => str.len() + 17,
             None => 17,
@@ -261,8 +255,7 @@ impl TcpResponse {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::<u8>::new();
-        buf.resize(self.len(), 0);
+        let mut buf: Vec<u8> = vec![0; self.size()];
         buf[0..16].copy_from_slice(self.correlation_id.as_bytes());
         buf[16] = self.response_code;
         match &self.payload {
@@ -277,8 +270,7 @@ impl TcpResponse {
 
 impl TcpHeaders {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.resize(self.len(), 0);
+        let mut buf = vec![0; self.size()];
         buf[0..16].copy_from_slice(&self.correlation_id.to_bytes_le());
         buf[16] = self.protocol_version;
         buf[17] = match self.request_type {
@@ -290,7 +282,7 @@ impl TcpHeaders {
         buf
     }
 
-    pub fn len(&self) -> usize {
+    pub fn size(&self) -> usize {
         20 // correlation id: 16, type: 1, flags: 2, version: 1
     }
 }
@@ -313,7 +305,7 @@ impl Payload {
         });
         buf
     }
-    pub fn len(&self) -> usize {
+    pub fn size(&self) -> usize {
         match &self.value {
             Some(value) => 8 + self.key.len() + value.len(),
             None => 4 + self.key.len(),
@@ -351,7 +343,7 @@ impl ParseError {
             | ParseError::MalformedPayload(c)
             | ParseError::MissingValue(c)
             | ParseError::UnknownFlags(c)
-            | ParseError::UnsupportedVersion(c) => c.clone(),
+            | ParseError::UnsupportedVersion(c) => *c,
         }
     }
 }
@@ -373,7 +365,7 @@ mod tests {
             flags: 0,
         };
         let mut buf = Vec::<u8>::new();
-        buf.resize(headers_write.len() + 4, 0);
+        buf.resize(headers_write.size() + 4, 0);
         buf[0..4].copy_from_slice(&MAGIC_BYTES);
         buf[4..].copy_from_slice(&headers_write.to_bytes());
         let headers_read = parse_headers(&buf);
@@ -396,7 +388,7 @@ mod tests {
             flags: 0,
         };
         let mut buf = Vec::<u8>::new();
-        buf.resize(headers_write.len() + 4, 0);
+        buf.resize(headers_write.size() + 4, 0);
         buf[0..4].copy_from_slice(&MAGIC_BYTES);
         buf[4..].copy_from_slice(&headers_write.to_bytes());
         let headers_read = parse_headers(&buf);
@@ -419,7 +411,7 @@ mod tests {
             flags: 0,
         };
         let mut buf = Vec::<u8>::new();
-        buf.resize(headers_write.len() + 4, 0);
+        buf.resize(headers_write.size() + 4, 0);
         buf[0..4].copy_from_slice(&MAGIC_BYTES);
         buf[4..].copy_from_slice(&headers_write.to_bytes());
         let headers_read = parse_headers(&buf);
@@ -445,7 +437,7 @@ mod tests {
             flags: 0,
         };
         let mut buf = Vec::<u8>::new();
-        buf.resize(headers_write.len() + 4, 0);
+        buf.resize(headers_write.size() + 4, 0);
         buf[0..4].copy_from_slice(&MAGIC_BYTES);
         buf[4..].copy_from_slice(&headers_write.to_bytes());
         let headers_read = parse_headers(&buf);
@@ -465,7 +457,7 @@ mod tests {
             flags: 0,
         };
         let mut buf = Vec::<u8>::new();
-        buf.resize(headers_write.len() + 4, 0);
+        buf.resize(headers_write.size() + 4, 0);
         buf[0..4].copy_from_slice(&MAGIC_BYTES);
         buf[0] += 1;
         buf[4..].copy_from_slice(&headers_write.to_bytes());

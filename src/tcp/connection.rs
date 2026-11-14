@@ -5,7 +5,7 @@ use crate::storage_engine::{StorageEngineError, Store};
 use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
@@ -54,7 +54,7 @@ where
     V: Store,
 {
     id: u64,
-    sender: Sender<ConnectionData>,
+    sender: UnboundedSender<ConnectionData>,
     reader: T,
     writer: U,
     storage_engine: Arc<V>,
@@ -84,18 +84,18 @@ where
 {
     pub fn new(
         id: u64,
-        sender: Sender<ConnectionData>,
+        sender: UnboundedSender<ConnectionData>,
         reader: T,
         writer: U,
         storage_engine: Arc<V>,
         token: CancellationToken,
     ) -> Self {
         TcpConnection {
-            id: id,
-            sender: sender,
-            reader: reader,
-            writer: writer,
-            storage_engine: storage_engine,
+            id,
+            sender,
+            reader,
+            writer,
+            storage_engine,
             do_cancel: token,
         }
     }
@@ -105,7 +105,7 @@ where
         tcp_request: TcpRequest,
     ) -> Result<Option<String>, StorageEngineError> {
         let op = Operation::from(tcp_request);
-        Ok(self.call_storage_engine(op).await?)
+        self.call_storage_engine(op).await
     }
 
     async fn call_storage_engine(
@@ -113,16 +113,16 @@ where
         op: Operation,
     ) -> Result<Option<String>, StorageEngineError> {
         match op {
-            Operation::Delete(key) => self.storage_engine.delete(&key).await,
+            Operation::Delete(key) => self.storage_engine.delete(key).await,
             Operation::Get(key) => self
                 .storage_engine
-                .get(&key)
+                .get(key)
                 .await
                 .and_then(|res| match res {
                     Some(value) => Ok(Some(value)),
                     None => Err(StorageEngineError::NotFound),
                 }),
-            Operation::Put(data) => self.storage_engine.put(&data.key, data.value).await,
+            Operation::Put(data) => self.storage_engine.put(data.key, data.value).await,
         }
     }
 
@@ -153,7 +153,7 @@ where
     async fn recv_and_handle_tcp_request(&mut self, header_len: u32) -> KeepAliveStatus {
         match recv_tcp_request(&mut self.reader, header_len).await {
             Ok(request) => {
-                let correlation_id = request.headers.correlation_id.clone();
+                let correlation_id = request.headers.correlation_id;
                 match self.handle_tcp_request(request).await {
                     Ok(res) => {
                         // TODO: handle send response failure
@@ -310,12 +310,12 @@ mod tests {
         let reader = Builder::new().read(&request.to_bytes()).build();
         let writer = Builder::new().write(&response.to_bytes()).build();
         let token = CancellationToken::new();
-        let (tx, _) = tokio::sync::mpsc::channel(1);
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
         let mut connection =
             TcpConnection::new(1, tx, reader, writer, storage_engine_ptr.clone(), token);
         connection.start(Duration::from_millis(10)).await;
         let res: Result<Option<String>, StorageEngineError> =
-            storage_engine_ptr.get(&String::from("key")).await;
+            storage_engine_ptr.get(String::from("key")).await;
         assert!(res.is_ok());
         let value = res.unwrap();
         assert!(value.is_some());
@@ -360,7 +360,7 @@ mod tests {
         let put_reader = Builder::new().read(&put_request.to_bytes()).build();
         let put_writer = Builder::new().write(&put_response.to_bytes()).build();
         let token = CancellationToken::new();
-        let (tx, _) = tokio::sync::mpsc::channel(1);
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
         let mut put_connection = TcpConnection::new(
             1,
             tx.clone(),
@@ -382,7 +382,7 @@ mod tests {
         );
         get_connection.start(Duration::from_millis(10)).await;
         let res: Result<Option<String>, StorageEngineError> =
-            storage_engine_ptr.get(&String::from("key")).await;
+            storage_engine_ptr.get(String::from("key")).await;
         assert!(res.is_ok());
         let value = res.unwrap();
         assert!(value.is_some());
@@ -433,7 +433,7 @@ mod tests {
             .write(&get_response.to_bytes())
             .build();
         let token = CancellationToken::new();
-        let (tx, _) = tokio::sync::mpsc::channel(1);
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
         let mut connection = TcpConnection::new(
             1,
             tx.clone(),
@@ -444,7 +444,7 @@ mod tests {
         );
         connection.start(Duration::from_millis(50)).await;
         let res: Result<Option<String>, StorageEngineError> =
-            storage_engine_ptr.get(&String::from("key")).await;
+            storage_engine_ptr.get(String::from("key")).await;
         assert!(res.is_ok());
         let value = res.unwrap();
         assert!(value.is_some());
@@ -455,7 +455,7 @@ mod tests {
     async fn connection_cancel_before_start() {
         let storage_engine = Arc::new(FakeStorageEngine::new());
         let put_res = storage_engine
-            .put(&String::from("key"), String::from("value1"))
+            .put(String::from("key"), String::from("value1"))
             .await;
         assert!(put_res.is_ok());
         let payload = Payload {
@@ -479,7 +479,7 @@ mod tests {
             .build_with_handle();
         let (writer, mut writer_handle) = Builder::new().build_with_handle();
         let token = CancellationToken::new();
-        let (tx, _) = tokio::sync::mpsc::channel(1);
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
         let mut connection = TcpConnection::new(
             1,
             tx.clone(),
@@ -496,7 +496,7 @@ mod tests {
         writer_handle.write(&response.to_bytes());
         let task_res = task_handle.await;
         assert!(task_res.is_ok());
-        let res = storage_engine.get(&String::from("key")).await;
+        let res = storage_engine.get(String::from("key")).await;
         assert!(res.is_ok());
         let value = res.unwrap();
         assert!(value.is_some());
@@ -507,7 +507,7 @@ mod tests {
     async fn connection_cancel_after_start() {
         let storage_engine = Arc::new(FakeStorageEngine::new());
         let put_res = storage_engine
-            .put(&String::from("key"), String::from("value1"))
+            .put(String::from("key"), String::from("value1"))
             .await;
         assert!(put_res.is_ok());
         let payload = Payload {
@@ -531,7 +531,7 @@ mod tests {
             .write(&response.to_bytes())
             .build_with_handle();
         let token = CancellationToken::new();
-        let (tx, _) = tokio::sync::mpsc::channel(1);
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
         let mut connection = TcpConnection::new(
             1,
             tx.clone(),
@@ -551,7 +551,7 @@ mod tests {
         assert!(task_timout_res.is_ok());
         let task_res = task_timout_res.unwrap();
         assert!(task_res.is_ok());
-        let res = storage_engine.get(&String::from("key")).await;
+        let res = storage_engine.get(String::from("key")).await;
         assert!(res.is_ok());
         let value = res.unwrap();
         assert!(value.is_some());
@@ -567,7 +567,7 @@ mod tests {
             .write(&TcpResponse::create_close_notification().to_bytes())
             .build();
         let token = CancellationToken::new();
-        let (tx, _) = tokio::sync::mpsc::channel(1);
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
         let mut connection = TcpConnection::new(
             1,
             tx.clone(),
@@ -636,9 +636,9 @@ mod tests {
     }
 
     impl Store for FakeStorageEngine {
-        async fn get(&self, key: &String) -> Result<Option<String>, StorageEngineError> {
+        async fn get(&self, key: String) -> Result<Option<String>, StorageEngineError> {
             let (tx, rx) = oneshot::channel();
-            let cmd = Command::Get(key.clone());
+            let cmd = Command::Get(key);
             let job = Job {
                 cmd: cmd,
                 sender: tx,
@@ -649,9 +649,9 @@ mod tests {
             rx.await.map_err(|_| StorageEngineError::Shutdown)
         }
 
-        async fn delete(&self, key: &String) -> Result<Option<String>, StorageEngineError> {
+        async fn delete(&self, key: String) -> Result<Option<String>, StorageEngineError> {
             let (tx, rx) = oneshot::channel();
-            let cmd = Command::Delete(key.clone());
+            let cmd = Command::Delete(key);
             let job = Job {
                 cmd: cmd,
                 sender: tx,
@@ -664,11 +664,11 @@ mod tests {
 
         async fn put(
             &self,
-            key: &String,
+            key: String,
             value: String,
         ) -> Result<Option<String>, StorageEngineError> {
             let (tx, rx) = oneshot::channel();
-            let cmd = Command::Put(key.clone(), value);
+            let cmd = Command::Put(key, value);
             let job = Job {
                 cmd: cmd,
                 sender: tx,

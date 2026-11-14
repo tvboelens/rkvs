@@ -14,16 +14,16 @@ mod sstable;
 pub trait Store {
     fn get(
         &self,
-        key: &String,
+        key: String,
     ) -> impl Future<Output = Result<Option<String>, StorageEngineError>> + Send;
     fn put(
         &self,
-        key: &String,
+        key: String,
         value: String,
     ) -> impl Future<Output = Result<Option<String>, StorageEngineError>> + Send;
     fn delete(
         &self,
-        key: &String,
+        key: String,
     ) -> impl Future<Output = Result<Option<String>, StorageEngineError>> + Send;
 }
 
@@ -68,7 +68,7 @@ pub enum StorageEngineError {
 }
 
 impl Store for StorageEngine {
-    async fn get(&self, key: &String) -> Result<Option<String>, StorageEngineError> {
+    async fn get(&self, key: String) -> Result<Option<String>, StorageEngineError> {
         let (tx, rx) = channel();
         let cmd = Command::Get(key.clone());
         let job = Job {
@@ -81,7 +81,7 @@ impl Store for StorageEngine {
             .and_then(|res| res.map_err(|_| StorageEngineError::IoError))
     }
 
-    async fn put(&self, key: &String, value: String) -> Result<Option<String>, StorageEngineError> {
+    async fn put(&self, key: String, value: String) -> Result<Option<String>, StorageEngineError> {
         let (tx, rx) = channel();
         let cmd = Command::Put(key.clone(), value);
         let job = Job {
@@ -94,7 +94,7 @@ impl Store for StorageEngine {
             .and_then(|res| res.map_err(|_| StorageEngineError::IoError))
     }
 
-    async fn delete(&self, key: &String) -> Result<Option<String>, StorageEngineError> {
+    async fn delete(&self, key: String) -> Result<Option<String>, StorageEngineError> {
         let (tx, rx) = channel();
         let cmd = Command::Delete(key.clone());
         let job = Job {
@@ -131,7 +131,7 @@ impl StorageEngine {
         let worker = Worker {
             memtable: Arc::new(memtable),
             sstable: sstable_ptr,
-            receiver: receiver,
+            receiver,
         };
         let mut join_handles = Vec::new();
         for _ in 0..6 {
@@ -141,7 +141,7 @@ impl StorageEngine {
         }
         Ok(StorageEngine {
             sender: tx,
-            join_handles: join_handles,
+            join_handles,
         })
     }
     /*
@@ -181,34 +181,34 @@ impl Worker {
                 }
             }
             let res = match job.command {
-                Command::Delete(key) => self.delete(&key),
+                Command::Delete(key) => self.delete(key),
                 Command::Get(key) => self.get(&key),
                 Command::Put(key, value) => self.put(key, value),
             };
-            let _ = job.sender.send(res).unwrap_or(());
+            job.sender.send(res).unwrap_or(())
         }
     }
 
-    fn get(&self, key: &String) -> io::Result<Option<String>> {
+    fn get(&self, key: &str) -> io::Result<Option<String>> {
         match self.memtable.get(key) {
             Some(mvalue) => Ok(mvalue.value),
             None => self
                 .sstable
                 .get(key)
-                .map(|opt| opt.map(|entry| entry.value).flatten()),
+                .map(|opt| opt.and_then(|entry| entry.value)),
         }
     }
 
     fn put(&self, key: String, value: String) -> io::Result<Option<String>> {
         self.memtable
             .put(key, value)
-            .map(|opt| opt.map(|mvalue| mvalue.value).flatten())
+            .map(|opt| opt.and_then(|mvalue| mvalue.value))
     }
 
-    fn delete(&self, key: &String) -> io::Result<Option<String>> {
+    fn delete(&self, key: String) -> io::Result<Option<String>> {
         self.memtable
             .delete(key)
-            .map(|opt| opt.map(|mvalue| mvalue.value).flatten())
+            .map(|opt| opt.and_then(|mvalue| mvalue.value))
     }
 }
 

@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Seek, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 static MAGIC_BYTES: [u8; 4] = [0x72, 0x6B, 0x76, 0x73]; //rkvs
@@ -112,7 +112,8 @@ impl Segment {
     /// Read a segment from a file
     pub fn from_file(path: PathBuf) -> Result<Self, SegmentOpenError> {
         let filename = path.file_name().unwrap().to_str().unwrap();
-        let (level_no, segment_no) = Segment::level_and_segment_number_from_filename(filename);
+        let (level_number, segment_number) =
+            Segment::level_and_segment_number_from_filename(filename);
         let mut rfile = OpenOptions::new()
             .read(true)
             .write(false)
@@ -126,7 +127,7 @@ impl Segment {
             return Err(SegmentOpenError::Corrupted);
         }
         let footer = SegmentFooter::from_bytes(
-            &footer_buf[0..SEGMENT_FOOTER_LEN as usize - MAGIC_BYTES.len()].to_vec(),
+            &footer_buf[0..SEGMENT_FOOTER_LEN as usize - MAGIC_BYTES.len()],
         );
 
         let mut index_buf = Vec::<u8>::new();
@@ -135,7 +136,7 @@ impl Segment {
         rfile.seek(io::SeekFrom::Start(footer.index_offset))?;
         rfile.read_exact(&mut index_buf)?;
         let index = SegmentIndex::from_bytes(&index_buf);
-        let first_key = Segment::read_table_entry(&rfile, &0)?.key;
+        let first_key = Segment::read_table_entry(&rfile, 0)?.key;
         let start: u64 = match index.indices.last() {
             None => 0,
             Some(idx) => idx.offset,
@@ -154,24 +155,24 @@ impl Segment {
         Ok(Segment {
             file: rfile,
             filepath: path,
-            highest_sequence_no: highest_sequence_no,
-            index: index,
+            highest_sequence_no,
+            index,
             size: metadata.size(),
-            number: segment_no,
+            number: segment_number,
             data_block_end: footer.index_offset,
-            first_key: first_key,
-            last_key: last_key,
-            level_number: level_no,
+            first_key,
+            last_key,
+            level_number,
         })
     }
 
     /// Finds the entry belonging to a key. If there is no entry,
     /// None is returned. The entry is wrapped in an io::Result, since
     /// it is read from disk.
-    pub fn get(&self, key: &String) -> io::Result<Option<SsTableEntry>> {
+    pub fn get(&self, key: &str) -> io::Result<Option<SsTableEntry>> {
         match self.index.find(key) {
             IndexSearchResult::Match(offset) => {
-                Segment::read_table_entry(&self.file, &offset).map(|entry| Some(entry))
+                Some(Segment::read_table_entry(&self.file, offset)).transpose()
             }
             IndexSearchResult::Range(start, opt) => {
                 let end = opt.unwrap_or(self.data_block_end);
@@ -179,7 +180,7 @@ impl Segment {
                 for entry in entries {
                     if entry.key == *key {
                         return Ok(Some(entry));
-                    } else if entry.key > *key {
+                    } else if *entry.key > *key {
                         return Ok(None);
                     }
                 }
@@ -202,11 +203,11 @@ impl Segment {
         entry_buf.resize(bytes_to_read as usize, 0);
         let mut total_bytes_read = 0;
         let mut buf_offset = 0;
-        let mut curr_offset = offset.clone();
+        let mut curr_offset = *offset;
         while total_bytes_read < bytes_to_read as usize {
             let bytes_read = self
                 .file
-                .read_at(&mut entry_buf[buf_offset..], curr_offset.clone())?;
+                .read_at(&mut entry_buf[buf_offset..], curr_offset)?;
             total_bytes_read += bytes_read;
             buf_offset += bytes_read;
             curr_offset += bytes_read as u64;
@@ -214,17 +215,17 @@ impl Segment {
                 break;
             }
         }
-        entry_buf.resize(total_bytes_read as usize, 0);
+        entry_buf.resize(total_bytes_read, 0);
         Ok(SsTableEntry::deque_from_bytes(&entry_buf))
     }
 
     /// Returns the first key contained in the segment.
-    pub fn first_key(&self) -> &String {
+    pub fn first_key(&self) -> &str {
         &self.first_key
     }
 
     /// Returns the final key contained in the segment.
-    pub fn last_key(&self) -> &String {
+    pub fn last_key(&self) -> &str {
         &self.last_key
     }
 
@@ -238,13 +239,12 @@ impl Segment {
 
     /// Reads multiple from the start position in the file to end position.
     fn read_table_entries(file: &File, start: u64, end: u64) -> io::Result<Vec<SsTableEntry>> {
-        let mut curr_offset = start.clone();
-        let mut buf = Vec::<u8>::new();
-        buf.resize(end as usize - start as usize, 0);
+        let mut curr_offset = start;
+        let mut buf = vec![0; (end - start) as usize];
         let mut buf_offset: usize = 0;
         let mut bytes_read: usize = 0;
         while bytes_read < buf.len() {
-            let curr_bytes_read = file.read_at(&mut buf[buf_offset..], curr_offset.clone())?;
+            let curr_bytes_read = file.read_at(&mut buf[buf_offset..], curr_offset)?;
             bytes_read += curr_bytes_read;
             buf_offset += bytes_read;
             curr_offset += bytes_read as u64;
@@ -256,13 +256,13 @@ impl Segment {
     }
 
     /// Read a single segment entry starting at offset
-    fn read_table_entry(file: &File, offset: &u64) -> io::Result<SsTableEntry> {
-        let mut curr_offset = offset.clone();
+    fn read_table_entry(file: &File, offset: u64) -> io::Result<SsTableEntry> {
+        let mut curr_offset = offset;
         let mut buf_offset: usize = 0;
         let mut u32_buf: [u8; size_of::<u32>()] = [0, 0, 0, 0];
         let mut bytes_read: usize = 0;
         while bytes_read < size_of::<u32>() {
-            let curr_bytes_read = file.read_at(&mut u32_buf[buf_offset..], curr_offset.clone())?;
+            let curr_bytes_read = file.read_at(&mut u32_buf[buf_offset..], curr_offset)?;
             bytes_read += curr_bytes_read;
             buf_offset += bytes_read;
             curr_offset += bytes_read as u64;
@@ -270,14 +270,12 @@ impl Segment {
                 break;
             }
         }
-        let entry_len = u32::from_le_bytes(u32_buf.clone());
-        let mut entry_buf = Vec::<u8>::new();
-        entry_buf.resize(entry_len as usize, 0);
+        let entry_len = u32::from_le_bytes(u32_buf);
+        let mut entry_buf = vec![0; entry_len as usize];
         bytes_read = 0;
         buf_offset = 0;
         while bytes_read < entry_len as usize {
-            let curr_bytes_read =
-                file.read_at(&mut entry_buf[buf_offset..], curr_offset.clone())?;
+            let curr_bytes_read = file.read_at(&mut entry_buf[buf_offset..], curr_offset)?;
             bytes_read += curr_bytes_read;
             buf_offset += bytes_read;
             curr_offset += bytes_read as u64;
@@ -345,7 +343,7 @@ impl SegmentWriter {
     /// i.e. this is the actual implementation of flushing
     /// a memtable to the sstable.
     pub fn segment_file_from_memtable(
-        dir: &PathBuf,
+        dir: &Path,
         table: &HashMap<String, MemTableValue>,
         segment_number: &u64,
         index_sparsity_factor: &u32,
@@ -355,16 +353,16 @@ impl SegmentWriter {
         let file = OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true)
             .open(filepath.clone())?;
         let mut writer = BufWriter::new(file);
         let mut keys: Vec<String> = table.keys().cloned().collect();
         keys.sort_unstable();
         let mut index = SegmentIndex::new();
-        let mut counter: u32 = 0;
         let mut offset: u64 = 0;
-        for key in keys {
-            if counter % index_sparsity_factor == 0 {
-                index.add_index(key.clone(), offset.clone());
+        for (counter, key) in (0u32..).zip(keys.into_iter()) {
+            if counter.is_multiple_of(*index_sparsity_factor) {
+                index.add_index(key.clone(), offset);
             }
             let value = table.get(&key).unwrap().clone();
             let entry = SsTableEntry::from(key, value);
@@ -374,7 +372,6 @@ impl SegmentWriter {
             offset += size_of::<u32>() as u64;
             writer.write_all(&bytes)?;
             offset += entry.len() as u64;
-            counter += 1;
         }
         writer.write_all(&index.to_bytes())?;
         let footer = SegmentFooter {
@@ -390,7 +387,7 @@ impl SegmentWriter {
     /// to the segment file, so after returning the segment file
     /// will still be empty.
     pub fn create_new_segment(
-        dir: &PathBuf,
+        dir: &Path,
         level_number: &u64,
         segment_number: &u64,
         index_sparsity_factor: u32,
@@ -400,15 +397,16 @@ impl SegmentWriter {
         let file = OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true)
             .open(filepath.clone())?;
         let size = file.metadata()?.size();
         Ok(SegmentWriter {
             writer: BufWriter::new(file),
-            filepath: filepath,
+            filepath,
             curr_size: size,
             entries_written: 0,
             index: SegmentIndex::new(),
-            index_sparsity_factor: index_sparsity_factor,
+            index_sparsity_factor,
             target_size: SEGMENT_SIZE,
             finished: false,
         })
@@ -455,7 +453,10 @@ impl SegmentWriter {
         self.writer.write_all(&bytes)?;
 
         self.entries_written += 1;
-        if (self.entries_written % self.index_sparsity_factor as u64) == 0 {
+        if self
+            .entries_written
+            .is_multiple_of(self.index_sparsity_factor as u64)
+        {
             self.index.add_index(entry.key.clone(), self.curr_size);
         }
         self.curr_size += (bytes.len() + size_of::<u32>()) as u64;
@@ -478,34 +479,31 @@ impl SegmentIndex {
         }
     }
 
-    fn find(&self, key: &String) -> IndexSearchResult {
+    fn find(&self, key: &str) -> IndexSearchResult {
         if self.indices.is_empty() {
-            return IndexSearchResult::Range(0, None);
-        } else if *key < self.indices[0].key {
-            return IndexSearchResult::Range(0, Some(self.indices[0].offset));
+            IndexSearchResult::Range(0, None)
+        } else if *key < *self.indices[0].key {
+            IndexSearchResult::Range(0, Some(self.indices[0].offset))
         } else {
             let (entry, idx) = self.binary_search(key);
             if *key == entry.key {
-                return IndexSearchResult::Match(entry.offset);
+                IndexSearchResult::Match(entry.offset)
             } else {
                 if idx < self.indices.len() - 1 {
-                    return IndexSearchResult::Range(
-                        entry.offset,
-                        Some(self.indices[idx + 1].offset),
-                    );
+                    IndexSearchResult::Range(entry.offset, Some(self.indices[idx + 1].offset))
                 } else {
-                    return IndexSearchResult::Range(entry.offset, None);
+                    IndexSearchResult::Range(entry.offset, None)
                 }
             }
         }
     }
 
-    fn binary_search(&self, key: &String) -> (&SegmentIndexEntry, usize) {
+    fn binary_search(&self, key: &str) -> (&SegmentIndexEntry, usize) {
         let mut l: usize = 0;
         let mut r = self.indices.len() - 1;
         let mut m = (l + r) / 2 + 1;
         while l < r {
-            if self.indices[m].key <= *key {
+            if *self.indices[m].key <= *key {
                 l = m;
             } else {
                 r = m - 1;
@@ -516,8 +514,7 @@ impl SegmentIndex {
     }
 
     fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.reserve(self.len);
+        let mut buf = Vec::with_capacity(self.len);
         for index in &self.indices {
             buf.append(&mut index.to_bytes());
         }
@@ -526,13 +523,10 @@ impl SegmentIndex {
 
     fn add_index(&mut self, key: String, offset: u64) {
         self.len += key.len() + size_of::<u64>() + size_of::<u32>();
-        self.indices.push(SegmentIndexEntry {
-            key: key,
-            offset: offset,
-        });
+        self.indices.push(SegmentIndexEntry { key, offset });
     }
 
-    fn from_bytes(buf: &Vec<u8>) -> Self {
+    fn from_bytes(buf: &[u8]) -> Self {
         let mut segment_index = SegmentIndex::new();
         let mut buf_offset: usize = 0;
         let mut u64_buf: [u8; size_of::<u64>()] = [0, 0, 0, 0, 0, 0, 0, 0];
@@ -563,8 +557,7 @@ impl SegmentIndex {
 impl SegmentIndexEntry {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut offset = 0;
-        let mut buf = Vec::<u8>::new();
-        buf.resize(self.key.len() + 2 * size_of::<u64>(), 0);
+        let mut buf = vec![0; self.key.len() + 2 * size_of::<u64>()];
         let len = self.key.len() as u32;
         buf[offset..offset + size_of::<u32>()].copy_from_slice(&len.to_le_bytes());
         offset += size_of::<u64>();
@@ -574,7 +567,7 @@ impl SegmentIndexEntry {
         buf
     }
 
-    pub fn from_bytes(buf: &Vec<u8>) -> Self {
+    pub fn from_bytes(buf: &[u8]) -> Self {
         let mut buf_offset = 0;
         let key_len = u32::from_le_bytes(
             buf[buf_offset..buf_offset + size_of::<u32>()]
@@ -589,25 +582,19 @@ impl SegmentIndexEntry {
                 .try_into()
                 .unwrap(),
         );
-        SegmentIndexEntry {
-            key: key,
-            offset: offset,
-        }
+        SegmentIndexEntry { key, offset }
     }
 }
 
 impl SegmentFooter {
-    pub fn from_bytes(buf: &Vec<u8>) -> Self {
+    pub fn from_bytes(buf: &[u8]) -> Self {
         assert_eq!(buf.len(), SEGMENT_FOOTER_LEN as usize - MAGIC_BYTES.len());
         let index_offset = u64::from_le_bytes(buf[0..size_of::<u64>()].try_into().unwrap());
-        SegmentFooter {
-            index_offset: index_offset,
-        }
+        SegmentFooter { index_offset }
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.resize(size_of::<u64>() + MAGIC_BYTES.len(), 0);
+        let mut buf = vec![0; size_of::<u64>() + MAGIC_BYTES.len()];
         buf[0..size_of::<u64>()].copy_from_slice(&self.index_offset.to_le_bytes());
         buf[size_of::<u64>()..].copy_from_slice(&MAGIC_BYTES);
         buf
@@ -619,7 +606,7 @@ impl SegmentReadBuf {
     /// and internally holds a maximum of read_buf_len bytes
     pub fn new(segment: Arc<Segment>, read_buf_len: u64) -> Self {
         SegmentReadBuf {
-            segment: segment,
+            segment,
             buf: VecDeque::new(),
             curr_offset: 0,
             size: 0,
@@ -649,11 +636,8 @@ impl SegmentBufReader for SegmentReadBuf {
     }
 
     fn pop_front(&mut self) -> Option<SsTableEntry> {
-        match self.buf.front() {
-            Some(entry) => {
-                self.size -= (entry.len() + size_of::<u32>()) as u64;
-            }
-            None => (),
+        if let Some(entry) = self.buf.front() {
+            self.size -= (entry.len() + size_of::<u32>()) as u64;
         }
         self.buf.pop_front()
     }

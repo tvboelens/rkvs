@@ -1,16 +1,16 @@
 use super::connection::{ConnectionData, ConnectionHandle};
 use std::collections::HashMap;
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_util::sync::CancellationToken;
 
 pub struct ConnectionManager {
     handles: HashMap<u64, ConnectionHandle>,
-    receiver: Receiver<ConnectionData>,
+    receiver: UnboundedReceiver<ConnectionData>,
     cancellation_token: CancellationToken,
 }
 
 impl ConnectionManager {
-    pub fn new(rx: Receiver<ConnectionData>, token: CancellationToken) -> Self {
+    pub fn new(rx: UnboundedReceiver<ConnectionData>, token: CancellationToken) -> Self {
         ConnectionManager {
             handles: HashMap::new(),
             receiver: rx,

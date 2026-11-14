@@ -15,11 +15,11 @@ pub struct Flusher {
 }
 
 impl Flusher {
-    pub fn from(sstable: Arc<SsTable>, dir: PathBuf, sparsity_factor: Arc<u32>) -> Self {
+    pub fn from(sstable: Arc<SsTable>, dir: PathBuf, index_sparsity_factor: Arc<u32>) -> Self {
         Flusher {
-            sstable: sstable,
-            dir: dir,
-            index_sparsity_factor: sparsity_factor,
+            sstable,
+            dir,
+            index_sparsity_factor,
         }
     }
 }
