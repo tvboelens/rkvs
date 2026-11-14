@@ -52,6 +52,20 @@ pub struct SegmentWriter {
     finished: bool,
 }
 
+pub trait SegmentBufReader {
+    /// Tries to read sstable entries from the segment until
+    /// either the maximum amount of bytes is read or
+    /// the last entry of the segment is read.
+    fn fill(&mut self) -> io::Result<()>;
+    /// Access the last entry in the buffer
+    fn back(&self) -> Option<&SsTableEntry>;
+    /// Access the first entry in the buffer
+    fn front(&self) -> Option<&SsTableEntry>;
+    /// Pop the first entry from the buffer
+    fn pop_front(&mut self) -> Option<SsTableEntry>;
+    fn is_empty(&self) -> bool;
+}
+
 /// Buffered reader for a single segment, which is used
 /// during merge compaction. Once it is filled it
 /// behaves like a queue, but it also has a method
@@ -59,7 +73,7 @@ pub struct SegmentWriter {
 #[derive(Debug)]
 pub struct SegmentReadBuf {
     segment: Arc<Segment>,
-    buf: VecDeque<SsTableEntry>,
+    pub buf: VecDeque<SsTableEntry>,
     curr_offset: u64,
     size: u64,
     max_size: u64,
@@ -612,11 +626,10 @@ impl SegmentReadBuf {
             max_size: read_buf_len,
         }
     }
+}
 
-    /// Tries to read sstable entries from the segment until
-    /// either the maximum amount of bytes is read or
-    /// the last entry of the segment is read.
-    pub fn fill(&mut self) -> io::Result<()> {
+impl SegmentBufReader for SegmentReadBuf {
+    fn fill(&mut self) -> io::Result<()> {
         let max_bytes = self.max_size - self.size;
         let new_entries = self.segment.read_at_most(&self.curr_offset, &max_bytes)?;
         for entry in new_entries {
@@ -627,18 +640,15 @@ impl SegmentReadBuf {
         Ok(())
     }
 
-    /// Access the last entry in the buffer
-    pub fn back(&self) -> Option<&SsTableEntry> {
+    fn back(&self) -> Option<&SsTableEntry> {
         self.buf.back()
     }
 
-    /// Access the first entry in the buffer
-    pub fn front(&self) -> Option<&SsTableEntry> {
+    fn front(&self) -> Option<&SsTableEntry> {
         self.buf.front()
     }
 
-    /// Pop the first entry from the buffer
-    pub fn pop_front(&mut self) -> Option<SsTableEntry> {
+    fn pop_front(&mut self) -> Option<SsTableEntry> {
         match self.buf.front() {
             Some(entry) => {
                 self.size -= (entry.len() + size_of::<u32>()) as u64;
@@ -648,7 +658,7 @@ impl SegmentReadBuf {
         self.buf.pop_front()
     }
 
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
 }
