@@ -1,10 +1,6 @@
-use crate::storage_engine::sstable::level::segment::{
-    SegmentOpenError, SegmentReadBuf, SegmentWriter,
-};
-
 use super::SsTableEntry;
-pub use segment::Segment;
-use std::collections::{HashMap, VecDeque};
+pub use segment::{Segment, SegmentBufReader, SegmentOpenError, SegmentReadBuf, SegmentWriter};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs::{read_dir, remove_file};
 use std::io::{self};
 use std::ops::Deref;
@@ -88,7 +84,7 @@ pub struct LevelContainer {
 pub enum MergeStatus {
     Pending,
     Finish,
-    Rollback,
+    Rollback(BTreeSet<u64>),
 }
 
 impl LevelContainer {
@@ -216,10 +212,11 @@ impl LevelContainer {
                 Some(next_level) => match level.check_merge_status(next_level)? {
                     MergeStatus::Pending => (),
                     MergeStatus::Finish => {
+                        // TODO: what about leftover files in the next level?
                         level.finish_merge()?;
                     }
-                    MergeStatus::Rollback => {
-                        next_level.rollback_merge()?;
+                    MergeStatus::Rollback(segments_to_rollback) => {
+                        next_level.rollback_merge(&segments_to_rollback)?;
                     }
                 },
             }
@@ -468,6 +465,7 @@ impl SstLevel for PartitionedLevel {
         2. not all are in next level -> compaction was interrupted
         3. none are in next level -> compaction not started
         */
+        let mut segment_numbers_rollback = BTreeSet::new();
         let mut found = false;
         let mut not_found = false;
         let mut it = self.segments_to_merge().into_iter();
@@ -476,40 +474,39 @@ impl SstLevel for PartitionedLevel {
             for entry in &entries {
                 let mut containing_segment_exists = false;
                 for nl_segment in &next_level.inner.segments {
+                    // If the key range of the segment does not include the entry key,
+                    // then we don't need to bother accessing the segment.
                     if *nl_segment.first_key() <= entry.key && entry.key <= *nl_segment.last_key() {
                         match nl_segment.get(&entry.key)? {
                             Some(nl_entry) => {
-                                if (*entry == nl_entry && not_found) || *entry != nl_entry && found
-                                {
-                                    return Ok(MergeStatus::Rollback);
-                                } else if *entry != nl_entry {
-                                    not_found = true;
-                                } else {
+                                if *entry == nl_entry {
                                     found = true;
                                     containing_segment_exists = true;
+                                    let _ = segment_numbers_rollback
+                                        .insert(*nl_segment.segment_number());
+                                } else {
+                                    not_found = true;
                                 }
                             }
                             None => {
-                                if found {
-                                    return Ok(MergeStatus::Rollback);
-                                }
+                                not_found = true;
                             }
                         }
                     }
                 }
+                // It is possible that for every segment the entry's key
+                // was not in the range of the segment
                 if !containing_segment_exists {
-                    if found {
-                        return Ok(MergeStatus::Rollback);
-                    } else {
-                        not_found = true;
-                    }
+                    not_found = true;
                 }
             }
         }
-        if found {
+        if found && !not_found {
             Ok(MergeStatus::Finish)
-        } else {
+        } else if !found && not_found {
             Ok(MergeStatus::Pending)
+        } else {
+            Ok(MergeStatus::Rollback(segment_numbers_rollback))
         }
     }
 }
@@ -669,7 +666,9 @@ impl PartitionedLevel {
     }
 }
 
-fn merge_sort(read_bufs: &mut HashMap<usize, &mut SegmentReadBuf>) -> VecDeque<SsTableEntry> {
+fn merge_sort(
+    read_bufs: &mut HashMap<usize, &mut impl SegmentBufReader>,
+) -> VecDeque<SsTableEntry> {
     if read_bufs.is_empty() {
         return VecDeque::new();
     } else if read_bufs.len() == 1 {
@@ -734,31 +733,34 @@ fn merge_sort(read_bufs: &mut HashMap<usize, &mut SegmentReadBuf>) -> VecDeque<S
     while !read_bufs.is_empty() {
         let mut curr_bufs = Vec::new();
         for idx in &curr_indices {
-            match read_bufs.remove(idx) {
-                Some(buf) => {
-                    curr_bufs.push(buf);
-                }
-                None => (),
-            }
+            read_bufs.remove(idx).map_or((), |buf| curr_bufs.push(buf))
         }
-        let next_key: Option<&String> = match next_indices.first() {
-            None => None,
-            Some(idx) => match read_bufs.get(idx).unwrap().front() {
-                None => None,
-                Some(entry) => Some(&entry.key),
-            },
-        };
+        let next_key = next_indices
+            .first()
+            .and_then(|idx| read_bufs.get(idx).unwrap().front())
+            .map(|entry| &entry.key)
+            .cloned();
         if curr_bufs.len() == 1 {
-            let curr_buf = curr_bufs.pop().unwrap();
+            let curr_buf = curr_bufs.first_mut().unwrap();
             while let Some(entry) = curr_buf.front() {
-                let do_continue = match next_key {
-                    None => entry.key <= smallest_final_key,
-                    Some(key) => entry.key < *key,
-                };
-                if do_continue {
-                    res.push_back(curr_buf.pop_front().unwrap());
-                } else {
-                    break;
+                match next_key.as_ref() {
+                    Some(key) => {
+                        if entry.key < *key {
+                            res.push_back(curr_buf.pop_front().unwrap());
+                        } else if entry.key == *key {
+                            next_indices.push(curr_indices.first().cloned().unwrap());
+                            break;
+                        } else {
+                            break;
+                        }
+                    }
+                    None => {
+                        if entry.key <= smallest_final_key {
+                            res.push_back(curr_buf.pop_front().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
                 }
             }
         } else {
@@ -796,7 +798,7 @@ fn merge_sort(read_bufs: &mut HashMap<usize, &mut SegmentReadBuf>) -> VecDeque<S
                         break;
                     }
                     Some(entry) => {
-                        let insert: bool = match next_key {
+                        let insert: bool = match next_key.as_ref() {
                             Some(nkey) => entry.key < *nkey,
                             None => entry.key <= smallest_final_key,
                         };
@@ -817,17 +819,21 @@ fn merge_sort(read_bufs: &mut HashMap<usize, &mut SegmentReadBuf>) -> VecDeque<S
                 }
             }
         }
-        let mut idx: usize = 0;
-        for buf in curr_bufs {
+        for (idx, buf) in curr_bufs.into_iter().enumerate() {
             match buf.front() {
                 Some(entry) => {
                     if entry.key <= smallest_final_key {
+                        // the current buf might need to be included in the next iteration
+                        let _ = next_key.as_ref().map_or((), |key| {
+                            if entry.key == *key {
+                                next_indices.push(curr_indices[idx]);
+                            }
+                        });
                         let _ = read_bufs.insert(curr_indices[idx].clone(), buf);
                     }
                 }
                 None => (),
             }
-            idx += 1;
         }
         std::mem::swap(&mut curr_indices, &mut next_indices);
         next_indices.clear();
@@ -936,8 +942,51 @@ impl SsTableLevel<PartitionedLevel> {
         self.inner.level_number
     }
 
-    fn rollback_merge(&mut self) -> io::Result<()> {
-        todo!()
+    fn rollback_merge(&mut self, segment_numbers: &BTreeSet<u64>) -> io::Result<()> {
+        self.inner
+            .segments
+            .sort_by(|s1, s2| s2.segment_number().cmp(s1.segment_number()));
+        let mut segments_to_delete = Vec::new();
+        let mut it = self.inner.segments.iter();
+        while let Some(segment) = it.next() {
+            if segment_numbers
+                .iter()
+                .find(|num| **num == *segment.segment_number())
+                .is_some()
+            {
+                segments_to_delete.push(segment.clone());
+                continue;
+            }
+            let mut it_older = it.clone();
+            while let Some(older_segment) = it_older.next() {
+                if segment.overlaps(older_segment) {
+                    segments_to_delete.push(segment.clone());
+                    break;
+                }
+            }
+        }
+        self.inner.segments.retain(|segment| {
+            segments_to_delete
+                .iter()
+                .find(|other| segment.segment_number() == other.segment_number())
+                .is_none()
+        });
+        for fp in segments_to_delete.iter().map(|segment| segment.filepath()) {
+            std::fs::remove_file(fp)?;
+        }
+        self.inner
+            .segments
+            .sort_by(|s1, s2| s1.segment_number().cmp(s2.segment_number()));
+        Ok(())
+        /*
+        1. Which segments to delete?
+        2. When merging we take entries from level i and level i+1
+        3. Is it possible for a new segment to contain only entries from level i or only from level i+1?
+            1. so basically we keep taking entries from one segment until the key is larger than or equal to the key of any other segment
+        4. so we need to delete new segments in the following cases
+            1. It contains keys from level i
+            2. It overlaps with an older segment
+        */
     }
 
     /// Removes the oldest segments until target size is not exceeded
@@ -1815,7 +1864,7 @@ mod tests {
             2,
         ));
         let status = level1.check_merge_status(&level2).unwrap();
-        assert!(matches!(status, MergeStatus::Rollback));
+        assert!(matches!(status, MergeStatus::Rollback(_)));
 
         let container = LevelContainer::from_dir(&dir, target_size / 2, 2, 10.into()).unwrap();
         assert_eq!(container.partitioned_levels.len(), 2);
@@ -1875,6 +1924,112 @@ mod tests {
         let segment = container.partitioned_levels[1].inner.segments[0].clone();
         let level_2_entries = segment.read_at_most(&0, &segment.size()).unwrap();
         assert_eq!(level_2_entries, entries);
+    }
+
+    struct FakeBufReader {
+        buf: VecDeque<SsTableEntry>,
+        next_entries: VecDeque<SsTableEntry>,
+        buf_size: usize,
+    }
+
+    impl SegmentBufReader for FakeBufReader {
+        fn back(&self) -> Option<&SsTableEntry> {
+            self.buf.back()
+        }
+
+        fn fill(&mut self) -> io::Result<()> {
+            while self.buf.len() < self.buf_size {
+                match self.next_entries.pop_front() {
+                    None => {
+                        break;
+                    }
+                    Some(entry) => {
+                        self.buf.push_back(entry);
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn front(&self) -> Option<&SsTableEntry> {
+            self.buf.front()
+        }
+
+        fn is_empty(&self) -> bool {
+            self.buf.is_empty()
+        }
+
+        fn pop_front(&mut self) -> Option<SsTableEntry> {
+            self.buf.pop_front()
+        }
+    }
+
+    #[test]
+    fn merge_sort_two_identical_keys() {
+        let mut read_buf1 = FakeBufReader {
+            buf: VecDeque::new(),
+            next_entries: vec![
+                SsTableEntry {
+                    key: String::from("key3"),
+                    value: None,
+                    sequence_number: 3,
+                },
+                SsTableEntry {
+                    key: String::from("key5"),
+                    value: Some(String::from("value5")),
+                    sequence_number: 5,
+                },
+            ]
+            .into(),
+            buf_size: 2,
+        };
+        read_buf1.fill().unwrap();
+        let mut read_buf2 = FakeBufReader {
+            buf: VecDeque::new(),
+            next_entries: vec![
+                SsTableEntry {
+                    key: String::from("key5"),
+                    value: None,
+                    sequence_number: 6,
+                },
+                SsTableEntry {
+                    key: String::from("key6"),
+                    value: Some(String::from("value6")),
+                    sequence_number: 7,
+                },
+            ]
+            .into(),
+            buf_size: 2,
+        };
+        read_buf2.fill().unwrap();
+        let mut read_bufs = HashMap::new();
+        read_bufs.insert(1, &mut read_buf1);
+        read_bufs.insert(2, &mut read_buf2);
+        let write_buf = merge_sort(&mut read_bufs);
+        let write_buf_expected: VecDeque<SsTableEntry> = vec![
+            SsTableEntry {
+                key: String::from("key3"),
+                value: None,
+                sequence_number: 3,
+            },
+            SsTableEntry {
+                key: String::from("key5"),
+                value: None,
+                sequence_number: 6,
+            },
+        ]
+        .into();
+        assert_eq!(write_buf, write_buf_expected);
+        read_buf1.fill().unwrap();
+        assert!(read_buf1.is_empty());
+        read_buf2.fill().unwrap();
+        assert!(matches!(
+        read_buf2.front(),
+        Some(entry) if *entry == SsTableEntry {
+            key: String::from("key6"),
+            value: Some(String::from("value6")),
+            sequence_number: 7
+        }))
     }
 }
 
