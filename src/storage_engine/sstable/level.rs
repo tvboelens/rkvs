@@ -683,6 +683,11 @@ fn merge_sort(
     let mut smallest_final_key = String::new();
     let mut curr_indices: Vec<usize> = Vec::new();
     let mut next_indices: Vec<usize> = Vec::new();
+    // Determine smallest_final_key, curr_indices, and next_indices
+    // smallest_final_key: only include entries with key smaller than or equal to this key
+    // curr_indices: indices of buffers in read_bufs from which we are currently adding entries into res
+    // next_indices: indices of buffers to use in the next iteration, some of the current buffers might have
+    //               to be added at the end of the iteration
     for (idx, buf) in read_bufs.iter() {
         if smallest_final_key.is_empty() || buf.back().unwrap().key < smallest_final_key {
             smallest_final_key = buf.back().unwrap().key.clone();
@@ -723,24 +728,28 @@ fn merge_sort(
             }
         }
     }
+    // discard buffers that do not have an entry to add
     read_bufs.retain(|_, buf| buf.front().unwrap().key <= smallest_final_key);
     // The next key could be in a buffer that is removed in the previous line,
     // therefore filter the next indices
-    next_indices = next_indices
-        .into_iter()
-        .filter(|idx| read_bufs.contains_key(idx))
-        .collect();
-    while !read_bufs.is_empty() {
-        let mut curr_bufs = Vec::new();
-        for idx in &curr_indices {
-            read_bufs.remove(idx).map_or((), |buf| curr_bufs.push(buf))
-        }
+    next_indices.retain(|idx| read_bufs.contains_key(idx));
+    while !curr_indices.is_empty() {
+        // Put the current buffers in a separate container to avoid difficulties
+        // with the borrow checker. If they have an entry with a key smaller than or equal
+        // to smallest_final_key, we reinsert them, else they will be discarded.
+        // In this way, read_bufs will get successively smaller.
+        let mut curr_bufs: Vec<_> = curr_indices
+            .iter()
+            .filter_map(|idx| read_bufs.remove(idx))
+            .collect();
         let next_key = next_indices
             .first()
             .and_then(|idx| read_bufs.get(idx).unwrap().front())
             .map(|entry| &entry.key)
-            .cloned();
+            .cloned(); // we need to avoid a borrow of read_bufs, since we need to mutably borrow it later
         if curr_bufs.len() == 1 {
+            // this case is easy, just keep adding until the key of next entry is
+            // greater than or equal to next_key or larger than smallest_final_key
             let curr_buf = curr_bufs.first_mut().unwrap();
             while let Some(entry) = curr_buf.front() {
                 match next_key.as_ref() {
@@ -748,9 +757,14 @@ fn merge_sort(
                         if entry.key < *key {
                             res.push_back(curr_buf.pop_front().unwrap());
                         } else if entry.key == *key {
+                            // make sure the current buf will also be selected in the next iteration
                             next_indices.push(curr_indices.first().cloned().unwrap());
                             break;
                         } else {
+                            if entry.key > smallest_final_key {
+                                // done with the current buffer, do not reinsert
+                                curr_bufs.clear();
+                            }
                             break;
                         }
                     }
@@ -758,20 +772,32 @@ fn merge_sort(
                         if entry.key <= smallest_final_key {
                             res.push_back(curr_buf.pop_front().unwrap());
                         } else {
+                            // done with the current buffer, do not reinsert
+                            curr_bufs.clear();
                             break;
                         }
                     }
                 }
             }
         } else {
-            let mut curr_entry: SsTableEntry = curr_bufs.first().unwrap().front().unwrap().clone();
-            for buf in curr_bufs.iter_mut() {
+            // In this case we have more than 1 buffers and their first entry all share
+            // the same key. We need to find the entry with the highest sequence number
+            let mut it = curr_bufs.iter_mut();
+            let mut curr_entry = it.next().unwrap().pop_front().unwrap();
+            while let Some(buf) = it.next() {
                 let entry = buf.pop_front().unwrap();
                 if entry.sequence_number > curr_entry.sequence_number {
                     curr_entry = entry;
                 }
             }
             res.push_back(curr_entry);
+            curr_bufs.retain(|buf| {
+                buf.front()
+                    .map_or(false, |entry| entry.key <= smallest_final_key)
+            });
+            // keep adding from from the current buffers until all keys of first entries in
+            // the current buffers are larger than next_key (or larger than smallest_final_key
+            // if next_key is None)
             loop {
                 let mut pot_next_entry: Option<&SsTableEntry> = None;
                 for buf in curr_bufs.iter() {
@@ -814,23 +840,29 @@ fn merge_sort(
                                 }
                             }
                             res.push_back(entry);
+                        } else {
+                            break;
                         }
                     }
                 }
+                curr_bufs.retain(|buf| {
+                    buf.front()
+                        .map_or(false, |entry| entry.key <= smallest_final_key)
+                });
             }
         }
         for (idx, buf) in curr_bufs.into_iter().enumerate() {
             match buf.front() {
                 Some(entry) => {
-                    if entry.key <= smallest_final_key {
-                        // the current buf might need to be included in the next iteration
-                        let _ = next_key.as_ref().map_or((), |key| {
-                            if entry.key == *key {
-                                next_indices.push(curr_indices[idx]);
-                            }
-                        });
-                        let _ = read_bufs.insert(curr_indices[idx].clone(), buf);
-                    }
+                    // the current buf might need to be included in the next iteration
+                    let _ = next_key.as_ref().map_or((), |key| {
+                        if entry.key == *key {
+                            next_indices.push(curr_indices[idx]);
+                        }
+                    });
+                    // we can always reinsert if non-empty, since we have already filtered out
+                    // buffers whose next entry has key larger than smallest_final_key
+                    let _ = read_bufs.insert(curr_indices[idx], buf);
                 }
                 None => (),
             }
@@ -838,7 +870,7 @@ fn merge_sort(
         std::mem::swap(&mut curr_indices, &mut next_indices);
         next_indices.clear();
         match curr_indices.first() {
-            None => (),
+            None => (), // done
             Some(curr_idx) => {
                 let curr_key = &read_bufs.get(curr_idx).unwrap().front().unwrap().key;
                 let mut next_key: Option<&String> = None;
@@ -846,18 +878,18 @@ fn merge_sort(
                     let buf_key = &buf.front().unwrap().key;
                     let push = match next_key {
                         None => *buf_key > *curr_key && *buf_key <= smallest_final_key,
-                        Some(key) => *buf_key > *curr_key && *buf_key <= *key,
+                        Some(key) => *buf_key > *curr_key && *buf_key == *key,
                     };
-                    let replace_and_clear = match next_key {
+                    let replace = match next_key {
                         None => *buf_key > *curr_key && *buf_key <= smallest_final_key,
                         Some(key) => *buf_key > *curr_key && *buf_key < *key,
                     };
-                    if replace_and_clear {
+                    if replace {
                         next_key = Some(&buf.front().unwrap().key);
-                        next_indices.clear();
+                        next_indices = vec![*idx];
                     }
                     if push {
-                        next_indices.push(idx.clone());
+                        next_indices.push(*idx);
                     }
                 }
             }

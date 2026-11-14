@@ -12,7 +12,7 @@ use std::thread::JoinHandle;
 
 use compaction::CompactionBt;
 
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug, Clone, Default)]
 pub struct SsTableEntry {
     pub key: String,
     pub value: Option<String>,
