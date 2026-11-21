@@ -612,7 +612,7 @@ impl PartitionedLevel {
         )?;
         new_segment_number += 1;
         for buf in &mut read_bufs {
-            buf.fill()?
+            buf.fill()?;
         }
         read_bufs.retain(|buf| !buf.is_empty());
 
@@ -752,10 +752,6 @@ fn merge_sort(
                             next_indices.push(curr_indices.first().cloned().unwrap());
                             break;
                         } else {
-                            if entry.key > smallest_final_key {
-                                // done with the current buffer, do not reinsert
-                                curr_bufs.clear();
-                            }
                             break;
                         }
                     }
@@ -763,8 +759,6 @@ fn merge_sort(
                         if entry.key <= smallest_final_key {
                             res.push_back(curr_buf.pop_front().unwrap());
                         } else {
-                            // done with the current buffer, do not reinsert
-                            curr_bufs.clear();
                             break;
                         }
                     }
@@ -830,23 +824,32 @@ fn merge_sort(
                         }
                     }
                 }
+                // do not use next_key for filtering, because we might have to reinsert
                 curr_bufs.retain(|buf| {
                     buf.front()
                         .is_some_and(|entry| entry.key <= smallest_final_key)
                 });
             }
         }
-        for (idx, buf) in curr_bufs.into_iter().enumerate() {
+        let min_idx = match read_bufs.keys().max() {
+            None => 0,
+            Some(i) => i + 1,
+        };
+        let it = (min_idx..).zip(curr_bufs.into_iter().filter(|buf| {
+            buf.front()
+                .is_some_and(|entry| entry.key <= smallest_final_key)
+        }));
+        for (idx, buf) in it {
             if let Some(entry) = buf.front() {
                 // the current buf might need to be included in the next iteration
                 let _ = next_key.as_ref().map(|key| {
                     if entry.key == *key {
-                        next_indices.push(curr_indices[idx]);
+                        next_indices.push(idx);
                     }
                 });
                 // we can always reinsert if non-empty, since we have already filtered out
                 // buffers whose next entry has key larger than smallest_final_key
-                let _ = read_bufs.insert(curr_indices[idx], buf);
+                let _ = read_bufs.insert(idx, buf);
             }
         }
         std::mem::swap(&mut curr_indices, &mut next_indices);
@@ -1978,6 +1981,11 @@ mod tests {
 
     #[test]
     fn merge_sort_two_identical_keys() {
+        /*
+        buf 1: {key3, None, 3}, {key5, value5, 5}
+        buf 2: {key5, None, 6}, {key6, value6, 7}
+        expected: {key3, None}, {key5, None} -> key6 for next iteration
+        */
         let mut read_buf1 = FakeBufReader {
             buf: VecDeque::new(),
             next_entries: vec![
@@ -2043,6 +2051,294 @@ mod tests {
             sequence_number: 7
         }))
     }
+
+    #[test]
+    fn merge_sort_two_overlapping_bufs_no_identical_keys() {
+        /*
+        buf 1: {key2, None}, {key3, value3}
+        buf 2: {key1, None}, {key4, value4}
+        expected: {key1, key2, key3} -> key4 only in next iteration
+         */
+        let mut read_buf1 = FakeBufReader {
+            buf: VecDeque::new(),
+            next_entries: vec![
+                SsTableEntry {
+                    key: String::from("key2"),
+                    value: None,
+                    sequence_number: 3,
+                },
+                SsTableEntry {
+                    key: String::from("key3"),
+                    value: Some(String::from("value3")),
+                    sequence_number: 5,
+                },
+            ]
+            .into(),
+            buf_size: 2,
+        };
+        read_buf1.fill().unwrap();
+        let mut read_buf2 = FakeBufReader {
+            buf: VecDeque::new(),
+            next_entries: vec![
+                SsTableEntry {
+                    key: String::from("key1"),
+                    value: None,
+                    sequence_number: 6,
+                },
+                SsTableEntry {
+                    key: String::from("key4"),
+                    value: Some(String::from("value4")),
+                    sequence_number: 7,
+                },
+            ]
+            .into(),
+            buf_size: 2,
+        };
+        read_buf2.fill().unwrap();
+        let mut read_bufs = HashMap::new();
+        read_bufs.insert(1, &mut read_buf1);
+        read_bufs.insert(2, &mut read_buf2);
+        let write_buf = merge_sort(&mut read_bufs);
+        let write_buf_expected: VecDeque<SsTableEntry> = vec![
+            SsTableEntry {
+                key: String::from("key1"),
+                value: None,
+                sequence_number: 6,
+            },
+            SsTableEntry {
+                key: String::from("key2"),
+                value: None,
+                sequence_number: 3,
+            },
+            SsTableEntry {
+                key: String::from("key3"),
+                value: Some(String::from("value3")),
+                sequence_number: 5,
+            },
+        ]
+        .into();
+        assert_eq!(write_buf, write_buf_expected);
+        read_buf1.fill().unwrap();
+        assert!(read_buf1.is_empty());
+        read_buf2.fill().unwrap();
+        assert!(matches!(
+        read_buf2.front(),
+        Some(entry) if *entry == SsTableEntry {
+            key: String::from("key4"),
+            value: Some(String::from("value4")),
+            sequence_number: 7
+        }))
+    }
+
+    #[test]
+    fn merge_sort_two_overlapping_bufs_identical_key_at_end() {
+        /*
+        buf 1: {key2, None}, {key4, None}
+        buf 2: {key1, None}, {key4, value4}
+        expected: {key1, key2, {key4, value4}}
+         */
+        let mut read_buf1 = FakeBufReader {
+            buf: VecDeque::new(),
+            next_entries: vec![
+                SsTableEntry {
+                    key: String::from("key2"),
+                    value: None,
+                    sequence_number: 3,
+                },
+                SsTableEntry {
+                    key: String::from("key4"),
+                    value: None,
+                    sequence_number: 5,
+                },
+            ]
+            .into(),
+            buf_size: 2,
+        };
+        read_buf1.fill().unwrap();
+        let mut read_buf2 = FakeBufReader {
+            buf: VecDeque::new(),
+            next_entries: vec![
+                SsTableEntry {
+                    key: String::from("key1"),
+                    value: None,
+                    sequence_number: 6,
+                },
+                SsTableEntry {
+                    key: String::from("key4"),
+                    value: Some(String::from("value4")),
+                    sequence_number: 7,
+                },
+            ]
+            .into(),
+            buf_size: 2,
+        };
+        read_buf2.fill().unwrap();
+        let mut read_bufs = HashMap::new();
+        read_bufs.insert(1, &mut read_buf1);
+        read_bufs.insert(2, &mut read_buf2);
+        let write_buf = merge_sort(&mut read_bufs);
+        let write_buf_expected: VecDeque<SsTableEntry> = vec![
+            SsTableEntry {
+                key: String::from("key1"),
+                value: None,
+                sequence_number: 6,
+            },
+            SsTableEntry {
+                key: String::from("key2"),
+                value: None,
+                sequence_number: 3,
+            },
+            SsTableEntry {
+                key: String::from("key4"),
+                value: Some(String::from("value4")),
+                sequence_number: 7,
+            },
+        ]
+        .into();
+        assert_eq!(write_buf, write_buf_expected);
+        read_buf1.fill().unwrap();
+        assert!(read_buf1.is_empty());
+        read_buf2.fill().unwrap();
+        assert!(read_buf2.is_empty());
+    }
+
+    #[test]
+    fn merge_sort_three_buffers_identical_keys_at_start() {
+        /*
+        buf 1: {key4, value4, 4}, {key5, value5, 5, 3}
+        buf 2: {key1, value1, 1}, {key3, value3, 8}, {key6, value6, 7}
+        buf 3: {key1, new_value1, 6}, {key2, value2, 2}, {key4, None, 9}, {key6, new_value6, 10}
+        expected: {key1, new_value1, 6}, {key2, value2, 2}, {key3, value3, 8},
+                  {key4, None, 9}, {key5, value5, 5, 3}
+        */
+        let mut read_buf1 = FakeBufReader {
+            buf: VecDeque::new(),
+            next_entries: vec![
+                SsTableEntry {
+                    key: String::from("key4"),
+                    value: Some(String::from("value4")),
+                    sequence_number: 4,
+                },
+                SsTableEntry {
+                    key: String::from("key5"),
+                    value: Some(String::from("value5")),
+                    sequence_number: 3,
+                },
+            ]
+            .into(),
+            buf_size: 2,
+        };
+        read_buf1.fill().unwrap();
+        // buf 2: {key1, value1, 1}, {key3, value3, 7}, {key6, value6, 7}
+        let mut read_buf2 = FakeBufReader {
+            buf: VecDeque::new(),
+            next_entries: vec![
+                SsTableEntry {
+                    key: String::from("key1"),
+                    value: Some(String::from("value1")),
+                    sequence_number: 1,
+                },
+                SsTableEntry {
+                    key: String::from("key3"),
+                    value: Some(String::from("value3")),
+                    sequence_number: 8,
+                },
+                SsTableEntry {
+                    key: String::from("key6"),
+                    value: Some(String::from("value6")),
+                    sequence_number: 7,
+                },
+            ]
+            .into(),
+            buf_size: 3,
+        };
+        read_buf2.fill().unwrap();
+        //buf 3: {key1, new_value1, 6}, {key2, value2, 2}, {key4, None, 9}
+        let mut read_buf3 = FakeBufReader {
+            buf: VecDeque::new(),
+            next_entries: vec![
+                SsTableEntry {
+                    key: String::from("key1"),
+                    value: Some(String::from("new_value1")),
+                    sequence_number: 6,
+                },
+                SsTableEntry {
+                    key: String::from("key2"),
+                    value: Some(String::from("value2")),
+                    sequence_number: 2,
+                },
+                SsTableEntry {
+                    key: String::from("key4"),
+                    value: None,
+                    sequence_number: 9,
+                },
+                SsTableEntry {
+                    key: String::from("key6"),
+                    value: Some(String::from("new_value6")),
+                    sequence_number: 10,
+                },
+            ]
+            .into(),
+            buf_size: 4,
+        };
+        read_buf3.fill().unwrap();
+        let mut read_bufs = HashMap::new();
+        read_bufs.insert(1, &mut read_buf1);
+        read_bufs.insert(2, &mut read_buf2);
+        read_bufs.insert(3, &mut read_buf3);
+        let write_buf = merge_sort(&mut read_bufs);
+        /*
+        expected: {key1, new_value1, 6}, {key2, value2, 2}, {key3, value3, 8},
+                  {key4, None, 9}, {key5, value5, 5, 3}
+        */
+        let write_buf_expected: VecDeque<SsTableEntry> = vec![
+            SsTableEntry {
+                key: String::from("key1"),
+                value: Some(String::from("new_value1")),
+                sequence_number: 6,
+            },
+            SsTableEntry {
+                key: String::from("key2"),
+                value: Some(String::from("value2")),
+                sequence_number: 2,
+            },
+            SsTableEntry {
+                key: String::from("key3"),
+                value: Some(String::from("value3")),
+                sequence_number: 8,
+            },
+            SsTableEntry {
+                key: String::from("key4"),
+                value: None,
+                sequence_number: 9,
+            },
+            SsTableEntry {
+                key: String::from("key5"),
+                value: Some(String::from("value5")),
+                sequence_number: 3,
+            },
+        ]
+        .into();
+        assert_eq!(write_buf, write_buf_expected);
+        read_buf1.fill().unwrap();
+        assert!(read_buf1.is_empty());
+        read_buf2.fill().unwrap();
+        assert!(matches!(
+        read_buf2.front(),
+        Some(entry) if *entry == SsTableEntry {
+            key: String::from("key6"),
+            value: Some(String::from("value6")),
+            sequence_number: 7
+        }));
+        read_buf3.fill().unwrap();
+        assert!(matches!(
+        read_buf3.front(),
+        Some(entry) if *entry == SsTableEntry {
+            key: String::from("key6"),
+            value: Some(String::from("new_value6")),
+            sequence_number: 10
+        }));
+    }
 }
 
 /*
@@ -2064,4 +2360,13 @@ Testing
             2. level 1 ok, level 2 too large -> merge into level 3
             3.
         2. level 0, level 1 and level 2
+    1. merge_sort
+        1. 2 buffers
+            1. No identical keys
+            2. identical keys in the middle
+            3. identical keys at the end
+            4. Should do something with refilling bufs maybe?
+        2. Multiple bufs -> 3 bufs should suffice
+            1. add multiple entries from 2 bufs before we reach the next key
+            2. so here again start, middle and end
 */
